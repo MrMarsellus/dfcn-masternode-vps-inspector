@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="dfcn-masternode-vps-inspector"
-VERSION="0.4.4"
+VERSION="0.4.5"
 BASE_DIR="${HOME}/.${APP_NAME}"
 INSTALL_PATH_DEFAULT="${HOME}/dfcn-masternode-vps-inspector.sh"
 LOG_DIR="${BASE_DIR}/logs"
@@ -281,7 +281,7 @@ chmod +x "$EVENT_SCRIPT"
 start_journal_follow(){ load_config; if [ -f "$TAIL_PID_FILE" ] && kill -0 "$(cat "$TAIL_PID_FILE")" 2>/dev/null; then return 0; fi; nohup bash -c "journalctl -u '$SERVICE_NAME' -f -o short-iso >> '$LOG_DIR/journal-follow.log' 2>&1" >/dev/null 2>&1 & echo $! > "$TAIL_PID_FILE"; }
 start_event_sampler(){ write_event_sampler; if [ -f "$EVENT_PID_FILE" ] && kill -0 "$(cat "$EVENT_PID_FILE")" 2>/dev/null; then return 0; fi; nohup ionice -c "$IONICE_CLASS" nice -n "$NICE_LEVEL" "$EVENT_SCRIPT" >> "$LOG_DIR/event-sampler-stdout.log" 2>&1 & sleep 1; }
 
-start_monitor(){ load_config; for c in systemctl journalctl ps ss awk sed grep timeout date df free ip nohup find flock; do require_cmd "$c"; done; [ -x "$CLI_BIN" ] || warn "CLI not found or not executable: $CLI_BIN"; write_monitor_script; system_snapshot "$LOG_DIR/system-snapshot-$(date '+%F-%H%M%S').txt"; collect_cli_snapshot "$LOG_DIR/cli-snapshot-$(date '+%F-%H%M%S').txt"; if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then warn "Monitor already running with PID $(cat "$PID_FILE")"; else nohup ionice -c "$IONICE_CLASS" nice -n "$NICE_LEVEL" "$MONITOR_SCRIPT" >> "$LOG_DIR/monitor-stdout.log" 2>&1 & sleep 1; fi; start_journal_follow; start_event_sampler; log "Inspector started. Logs: $LOG_DIR"; echo "Recommended next steps: menu 6 (status), later menu 2 (stop + report)."; }
+start_monitor(){ load_config; for c in systemctl journalctl ps ss awk sed grep timeout date df free ip nohup find flock; do require_cmd "$c"; done; [ -x "$CLI_BIN" ] || warn "CLI not found or not executable: $CLI_BIN"; write_monitor_script; system_snapshot "$LOG_DIR/system-snapshot-$(date '+%F-%H%M%S').txt"; collect_cli_snapshot "$LOG_DIR/cli-snapshot-$(date '+%F-%H%M%S').txt"; if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then warn "Monitor already running with PID $(cat "$PID_FILE")"; else nohup ionice -c "$IONICE_CLASS" nice -n "$NICE_LEVEL" "$MONITOR_SCRIPT" >> "$LOG_DIR/monitor-stdout.log" 2>&1 & sleep 1; fi; start_journal_follow; start_event_sampler; log "Inspector started. Logs: $LOG_DIR"; echo "Recommended next steps: menu 9 (exit script; background logging continues), later menu 2 (stop + report)."; }
 stop_monitor(){ local any=0; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then any=1; kill "$(cat "$f")" || true; sleep 1; kill -9 "$(cat "$f")" 2>/dev/null || true; rm -f "$f"; fi; done; if [ "$any" -eq 1 ]; then log "All background processes stopped"; else log "No running background processes found"; fi; }
 
 write_instant_analysis(){
@@ -409,6 +409,9 @@ Menu:
   6) Show status
   7) Self test
   8) Show recommended workflow
+  9) Exit script
+
+Note: Exiting this menu does not stop background logging once it has been started.
 
 Direct usage:
   $0 start
@@ -464,6 +467,10 @@ menu(){
       8)
         show_workflow
         post_action_menu_prompt || break
+        ;;
+      9)
+        echo "Exiting menu. Background logging, if started, continues running."
+        break
         ;;
       *)
         echo "Invalid choice" ; press_enter ;;
