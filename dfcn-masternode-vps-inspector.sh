@@ -291,9 +291,9 @@ generate_report(){ write_analyze_script; mapfile -t generated < <("$ANALYZE_SCRI
 instant_analysis(){ load_config; out="$REPORT_DIR/instant-analysis-$(date '+%F-%H%M%S').md"; write_instant_analysis "$out"; log "Instant analysis created: $out"; printf '%s\n' "$out"; }
 cleanup_all(){ if ask_yes_no "Really delete ALL inspector data, logs and reports?" n; then stop_monitor || true; rm -rf "$BASE_DIR"; log "All inspector data removed: $BASE_DIR"; else log "Aborted"; fi; }
 show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Install : $INSTALL_PATH_DEFAULT"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; echo "IO test : ${IO_TEST_ENABLED:-unset}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }
-selftest(){
+selftest() {
+  load_config
   {
-    load_config
     echo "Core commands:"
     for c in awk sed grep ps ss systemctl journalctl nohup timeout date df free ip find flock ionice nice; do
       if have_cmd "$c"; then
@@ -310,7 +310,11 @@ selftest(){
     ls -ld "$DATA_DIR" 2>/dev/null || true
     echo
     echo "CLI probe:"
-    timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null | head -n 20 || true
+    if have_cmd jq; then
+      timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null | jq . || true
+    else
+      timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null || true
+    fi
   } | less
 }
 show_workflow(){ cat <<EOF2
