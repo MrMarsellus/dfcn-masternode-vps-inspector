@@ -33,6 +33,10 @@ LOG_LEVEL_DEFAULT="basic"
 PROTX_HASH_DEFAULT=""
 IO_TEST_ENABLED_DEFAULT="1"
 
+print_line() {
+  echo "------------------------------------------------------------"
+}
+
 umask 077
 mkdir -p "$BASE_DIR" "$LOG_DIR" "$RUN_DIR" "$REPORT_DIR"
 
@@ -299,8 +303,13 @@ handle_post_action(){
   post_action_menu_prompt
 }
 
-usage(){ cat <<EOF2
-$APP_NAME v$VERSION
+usage() {
+  print_line
+  print_line
+  echo "$APP_NAME v$VERSION"
+  print_line
+  print_line
+  cat <<EOF2
 
 Menu:
   1) Start inspection and logging
