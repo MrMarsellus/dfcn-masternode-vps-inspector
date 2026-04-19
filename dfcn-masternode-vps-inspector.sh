@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail  # strict error handling
+set -Eeuo pipefail
 
 APP_NAME="dfcn-masternode-vps-inspector"
-VERSION="0.4.1"
+VERSION="0.4.2"
 BASE_DIR="${HOME}/.${APP_NAME}"
 LOG_DIR="${BASE_DIR}/logs"
 RUN_DIR="${BASE_DIR}/run"
@@ -11,12 +11,10 @@ CFG_FILE="${BASE_DIR}/config.env"
 MONITOR_SCRIPT="${BASE_DIR}/monitor.sh"
 ANALYZE_SCRIPT="${BASE_DIR}/analyze.sh"
 EVENT_SCRIPT="${BASE_DIR}/event-sampler.sh"
-LOCK_FILE="${RUN_DIR}/monitor.lock"
 PID_FILE="${RUN_DIR}/monitor.pid"
 TAIL_PID_FILE="${RUN_DIR}/journal_tail.pid"
 EVENT_PID_FILE="${RUN_DIR}/event_sampler.pid"
 
-# default paths and intervals
 SERVICE_NAME_DEFAULT="defcond.service"
 CLI_BIN_DEFAULT="/usr/local/bin/defcon-cli"
 DAEMON_BIN_DEFAULT="/usr/local/bin/defcond"
@@ -30,11 +28,11 @@ RETENTION_DAYS_DEFAULT="21"
 IONICE_CLASS_DEFAULT="3"
 NICE_LEVEL_DEFAULT="10"
 PEER_SAMPLE_MAXKB_DEFAULT="32"
-LOG_LEVEL_DEFAULT="basic"      # basic or debug
-PROTX_HASH_DEFAULT=""          # optional protx hash for pose tracking
-IO_TEST_ENABLED_DEFAULT="1"    # 1 = enable lightweight IO test, 0 = disable
+LOG_LEVEL_DEFAULT="basic"
+PROTX_HASH_DEFAULT=""
+IO_TEST_ENABLED_DEFAULT="1"
 
-umask 077  # secure file permissions
+umask 077
 mkdir -p "$BASE_DIR" "$LOG_DIR" "$RUN_DIR" "$REPORT_DIR"
 
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -229,16 +227,40 @@ CFG_FILE="${BASE_DIR}/config.env"
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 # shellcheck disable=SC1090
 source "$CFG_FILE"
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 exec 9>"${RUN_DIR}/monitor.lock"
 flock -n 9 || { echo "monitor already running"; exit 1; }
 echo $$ > "${RUN_DIR}/monitor.pid"
 TS_CSV="${LOG_DIR}/timeseries.csv"
 PEER_LOG="${LOG_DIR}/peer-samples.log"
 QUORUM_LOG="${LOG_DIR}/quorum-samples.log"
-[ -f "$TS_CSV" ] || echo "timestamp,load1,load5,load15,cpu_user,cpu_system,cpu_idle,mem_total_kb,mem_avail_kb,swap_total_kb,swap_free_kb,root_use_pct,datadir_use_pct,rx_bytes,tx_bytes,established_conns,defcond_cpu_pct,defcond_mem_pct,defcond_rss_kb,defcond_threads,defcond_fd_count,io_ms,chain_blocks,headers,verificationprogress,connections,mn_synced,mn_state,pose_penalty,pose_banheight,peer_total,peer_inbound,peer_outbound,peer_ping_avg_ms,peer_ping_max_ms,peer_high_ping_count,ntp_offset_ms,service_restarts,psi_cpu_some_avg10,psi_mem_some_avg10,psi_io_some_avg10" > "$TS_CSV"
+HEADER="timestamp,load1,load5,load15,cpu_user,cpu_system,cpu_idle,mem_total_kb,mem_avail_kb,swap_total_kb,swap_free_kb,root_use_pct,datadir_use_pct,rx_bytes,tx_bytes,established_conns,defcond_cpu_pct,defcond_mem_pct,defcond_rss_kb,defcond_threads,defcond_fd_count,io_ms,chain_blocks,headers,verificationprogress,connections,mn_synced,mn_state,pose_penalty,pose_banheight,peer_total,peer_inbound,peer_outbound,peer_ping_avg_ms,peer_ping_max_ms,peer_high_ping_count,ntp_offset_ms,service_restarts,psi_cpu_some_avg10,psi_mem_some_avg10,psi_io_some_avg10"
+[ -f "$TS_CSV" ] || echo "$HEADER" > "$TS_CSV"
 cleanup(){ rm -f "${RUN_DIR}/monitor.pid"; }
 trap cleanup EXIT
 get_cpu(){ awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9,$10}' /proc/stat; }
+json_count_array_objects(){ awk 'BEGIN{c=0} /\{/{c++} END{print c+0}'; }
+peer_summary_with_jq(){
+  jq -r '[
+    length,
+    map(select(.inbound==true))|length,
+    map(select(.inbound==false))|length,
+    (map(select(.pingtime!=null)|.pingtime) | if length>0 then ((add/length)*1000) else null end),
+    (map(select(.pingtime!=null)|.pingtime) | if length>0 then (max*1000) else null end),
+    (map(select(.pingtime!=null and .pingtime>0.8))|length)
+  ] | @tsv' 2>/dev/null
+}
+peer_summary_plain(){
+  local blob="$1"
+  local total inbound outbound avg max high
+  total=$(printf '%s' "$blob" | awk 'BEGIN{RS="{";c=0} /"addr"[[:space:]]*:/{c++} END{print c+0}')
+  inbound=$(printf '%s' "$blob" | awk 'BEGIN{RS="{";c=0} /"addr"[[:space:]]*:/ && /"inbound"[[:space:]]*:[[:space:]]*true/{c++} END{print c+0}')
+  outbound=$(printf '%s' "$blob" | awk 'BEGIN{RS="{";c=0} /"addr"[[:space:]]*:/ && /"inbound"[[:space:]]*:[[:space:]]*false/{c++} END{print c+0}')
+  avg=$(printf '%s' "$blob" | awk 'BEGIN{RS="{"} /"pingtime"[[:space:]]*:/{for(i=1;i<=NF;i++) if($i ~ /"pingtime"/) {v=$(i+1); gsub(/[,:}]/,"",v); if(v!=""){sum+=v;n++}}} END{if(n>0) printf "%.2f", (sum*1000/n); else printf ""}')
+  max=$(printf '%s' "$blob" | awk 'BEGIN{RS="{"} /"pingtime"[[:space:]]*:/{for(i=1;i<=NF;i++) if($i ~ /"pingtime"/) {v=$(i+1); gsub(/[,:}]/,"",v); if(v!="" && v>m)m=v}} END{if(m>0) printf "%.2f", (m*1000); else printf ""}')
+  high=$(printf '%s' "$blob" | awk 'BEGIN{RS="{";c=0} /"pingtime"[[:space:]]*:/{for(i=1;i<=NF;i++) if($i ~ /"pingtime"/) {v=$(i+1); gsub(/[,:}]/,"",v); if(v!="" && v+0>0.8)c++}} END{print c+0}')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$total" "$inbound" "$outbound" "$avg" "$max" "$high"
+}
 read -r u1 n1 s1 i1 w1 irq1 sirq1 st1 g1 < <(get_cpu)
 sleep 1
 read -r u2 n2 s2 i2 w2 irq2 sirq2 st2 g2 < <(get_cpu)
@@ -282,7 +304,7 @@ while true; do
   psi_cpu_some_avg10=$(psi_avg10 /proc/pressure/cpu); psi_mem_some_avg10=$(psi_avg10 /proc/pressure/memory); psi_io_some_avg10=$(psi_avg10 /proc/pressure/io)
   service_restarts=$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null || true)
   if have_cmd chronyc; then
-    ntp_offset_ms=$(chronyc tracking 2>/dev/null | awk -F':' '/System time/{gsub(/^[[:space:]]+| seconds.*/ ,"",$2); print ($2*1000)}' | head -n1)
+    ntp_offset_ms=$(chronyc tracking 2>/dev/null | awk -F':' '/System time/{gsub(/^[[:space:]]+| seconds.*/,"",$2); print ($2*1000)}' | head -n1)
   fi
   if [ -x "$CLI_BIN" ]; then
     info=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null || true)
@@ -301,12 +323,11 @@ while true; do
       pose_penalty=$(printf '%s' "$protx_info" | sed -n 's/.*"PoSePenalty"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n1)
       pose_banheight=$(printf '%s' "$protx_info" | sed -n 's/.*"PoSeBanHeight"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n1)
     fi
-    peer_total=$(printf '%s' "$peers_json" | grep -c '"addr"')
-    peer_inbound=$(printf '%s' "$peers_json" | grep -c '"inbound"[[:space:]]*:[[:space:]]*true')
-    peer_outbound=$(printf '%s' "$peers_json" | grep -c '"inbound"[[:space:]]*:[[:space:]]*false')
-    peer_ping_avg_ms=$(printf '%s' "$peers_json" | awk '/"pingtime"/{gsub(/[,]/,""); sum+=$2; n++} END{if(n>0) printf "%.2f", sum*1000/n}')
-    peer_ping_max_ms=$(printf '%s' "$peers_json" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>m)m=$2} END{if(m>0) printf "%.2f", m*1000}')
-    peer_high_ping_count=$(printf '%s' "$peers_json" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>0.8)c++} END{print c+0}')
+    if have_cmd jq; then
+      read -r peer_total peer_inbound peer_outbound peer_ping_avg_ms peer_ping_max_ms peer_high_ping_count <<< "$(printf '%s' "$peers_json" | peer_summary_with_jq | tr '\t' ' ')"
+    else
+      read -r peer_total peer_inbound peer_outbound peer_ping_avg_ms peer_ping_max_ms peer_high_ping_count <<< "$(peer_summary_plain "$peers_json" | tr '\t' ' ')"
+    fi
     if [ "${LOG_LEVEL:-basic}" = "debug" ]; then
       printf '%s | getpeerinfo\n' "$ts" >> "$PEER_LOG"
       printf '%s' "$peers_json" | head -c "$((PEER_SAMPLE_MAXKB*1024))" >> "$PEER_LOG" || true
@@ -335,6 +356,7 @@ RUN_DIR="${BASE_DIR}/run"
 CFG_FILE="${BASE_DIR}/config.env"
 # shellcheck disable=SC1090
 source "$CFG_FILE"
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 echo $$ > "${RUN_DIR}/event_sampler.pid"
 EVENT_LOG="${LOG_DIR}/events.log"
 POSE_LOG="${LOG_DIR}/pose-events.log"
@@ -407,16 +429,19 @@ start_monitor(){
   start_journal_follow
   start_event_sampler
   log "Inspector started. Logs: $LOG_DIR"
+  echo "Recommended next steps: first run 'status' or menu 6, later stop with menu 2 / stop-report."
 }
 
 stop_monitor(){
+  local any=0
   for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do
     if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then
+      any=1
       kill "$(cat "$f")" || true; sleep 1; kill -9 "$(cat "$f")" 2>/dev/null || true
       rm -f "$f"
     fi
   done
-  log "All background processes stopped"
+  if [ "$any" -eq 1 ]; then log "All background processes stopped"; else log "No running background processes found"; fi
 }
 
 write_instant_analysis(){
@@ -461,12 +486,13 @@ write_instant_analysis(){
       echo
       echo "## Peer summary"
       peers=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>/dev/null || true)
-      printf 'total=%s\n' "$(printf '%s' "$peers" | grep -c '"addr"')"
-      printf 'inbound=%s\n' "$(printf '%s' "$peers" | grep -c '"inbound"[[:space:]]*:[[:space:]]*true')"
-      printf 'outbound=%s\n' "$(printf '%s' "$peers" | grep -c '"inbound"[[:space:]]*:[[:space:]]*false')"
-      printf 'avg_ping_ms=%s\n' "$(printf '%s' "$peers" | awk '/"pingtime"/{gsub(/[,]/,""); sum+=$2; n++} END{if(n>0) printf "%.2f", sum*1000/n; else print "n/a"}')"
-      printf 'max_ping_ms=%s\n' "$(printf '%s' "$peers" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>m)m=$2} END{if(m>0) printf "%.2f", m*1000; else print "n/a"}')"
-      printf 'high_ping_count_gt_800ms=%s\n' "$(printf '%s' "$peers" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>0.8)c++} END{print c+0}')"
+      if have_cmd jq; then
+        printf '%s' "$peers" | jq -r '{total:length,inbound:(map(select(.inbound==true))|length),outbound:(map(select(.inbound==false))|length),avg_ping_ms:(map(select(.pingtime!=null)|.pingtime)|if length>0 then ((add/length)*1000) else null end),max_ping_ms:(map(select(.pingtime!=null)|.pingtime)|if length>0 then (max*1000) else null end),high_ping_count_gt_800ms:(map(select(.pingtime!=null and .pingtime>0.8))|length)}'
+      else
+        printf 'total=%s\n' "$(printf '%s' "$peers" | awk 'BEGIN{RS="{";c=0} /"addr"[[:space:]]*:/{c++} END{print c+0}')"
+        printf 'inbound=%s\n' "$(printf '%s' "$peers" | awk 'BEGIN{RS="{";c=0} /"addr"[[:space:]]*:/ && /"inbound"[[:space:]]*:[[:space:]]*true/{c++} END{print c+0}')"
+        printf 'outbound=%s\n' "$(printf '%s' "$peers" | awk 'BEGIN{RS="{";c=0} /"addr"[[:space:]]*:/ && /"inbound"[[:space:]]*:[[:space:]]*false/{c++} END{print c+0}')"
+      fi
     else
       echo "CLI not found: $CLI_BIN"
     fi
@@ -490,6 +516,8 @@ REPORT_MD="${REPORT_DIR}/report-$(date '+%F-%H%M%S').md"
 REPORT_TXT="${REPORT_DIR}/summary-$(date '+%F-%H%M%S').txt"
 score=0
 score_line(){ score=$((score+$1)); }
+col_idx(){ awk -F',' -v name="$1" 'NR==1{for(i=1;i<=NF;i++) if($i==name){print i; exit}}' "$TS_CSV"; }
+value_by_name(){ local row="$1" name="$2" idx; idx=$(col_idx "$name"); [ -n "$idx" ] && awk -F',' -v n="$idx" 'NR>1{print $n}' "$row"; }
 {
   echo "# DFCN Masternode VPS Inspector Report"
   echo
@@ -499,18 +527,34 @@ score_line(){ score=$((score+$1)); }
   if [ -f "$TS_CSV" ]; then
     total_samples=$(($(wc -l < "$TS_CSV")-1))
     echo "- Samples: $total_samples"
-    max_load=$(awk -F',' 'NR>1{if($2>m)m=$2} END{print m+0}' "$TS_CSV")
-    min_mem=$(awk -F',' 'NR>1{if(min==""||$9<min)min=$9} END{print min+0}' "$TS_CSV")
-    max_cpu=$(awk -F',' 'NR>1{if($17>m)m=$17} END{print m+0}' "$TS_CSV")
-    max_mem=$(awk -F',' 'NR>1{if($18>m)m=$18} END{print m+0}' "$TS_CSV")
-    max_fd=$(awk -F',' 'NR>1{if($21>m)m=$21} END{print m+0}' "$TS_CSV")
-    max_io=$(awk -F',' 'NR>1{if($22>m)m=$22} END{print m+0}' "$TS_CSV")
-    low_conn=$(awk -F',' 'NR>1 && ($26=="" || $26+0<3){c++} END{print c+0}' "$TS_CSV")
-    lagging=$(awk -F',' 'NR>1 && $23!="" && $24!="" && ($24-$23)>3 {c++} END{print c+0}' "$TS_CSV")
-    high_ping=$(awk -F',' 'NR>1 && $36!="" && $36+0>0 {c++} END{print c+0}' "$TS_CSV")
-    ntp_bad=$(awk -F',' 'NR>1 && $37!="" && ($37+0>200 || $37+0<-200) {c++} END{print c+0}' "$TS_CSV")
-    psi_mem_bad=$(awk -F',' 'NR>1 && $40!="" && $40+0>1 {c++} END{print c+0}' "$TS_CSV")
-    restart_samples=$(awk -F',' 'NR>1 && $38!="" && $38+0>0 {c++} END{print c+0}' "$TS_CSV")
+    idx_load1=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="load1") print i}' "$TS_CSV")
+    idx_mem_avail=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="mem_avail_kb") print i}' "$TS_CSV")
+    idx_defcpu=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="defcond_cpu_pct") print i}' "$TS_CSV")
+    idx_defmem=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="defcond_mem_pct") print i}' "$TS_CSV")
+    idx_fd=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="defcond_fd_count") print i}' "$TS_CSV")
+    idx_io=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="io_ms") print i}' "$TS_CSV")
+    idx_conn=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="connections") print i}' "$TS_CSV")
+    idx_blocks=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="chain_blocks") print i}' "$TS_CSV")
+    idx_headers=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="headers") print i}' "$TS_CSV")
+    idx_highping=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="peer_high_ping_count") print i}' "$TS_CSV")
+    idx_ntp=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="ntp_offset_ms") print i}' "$TS_CSV")
+    idx_restarts=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="service_restarts") print i}' "$TS_CSV")
+    idx_psi_mem=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="psi_mem_some_avg10") print i}' "$TS_CSV")
+    idx_pose=$(awk -F',' 'NR==1{for(i=1;i<=NF;i++) if($i=="pose_penalty") print i}' "$TS_CSV")
+    max_load=$(awk -F',' -v c="$idx_load1" 'NR>1 && c>0{if($c>m)m=$c} END{print m+0}' "$TS_CSV")
+    min_mem=$(awk -F',' -v c="$idx_mem_avail" 'NR>1 && c>0{if(min==""||$c<min)min=$c} END{print min+0}' "$TS_CSV")
+    max_cpu=$(awk -F',' -v c="$idx_defcpu" 'NR>1 && c>0{if($c>m)m=$c} END{print m+0}' "$TS_CSV")
+    max_mem=$(awk -F',' -v c="$idx_defmem" 'NR>1 && c>0{if($c>m)m=$c} END{print m+0}' "$TS_CSV")
+    max_fd=$(awk -F',' -v c="$idx_fd" 'NR>1 && c>0{if($c>m)m=$c} END{print m+0}' "$TS_CSV")
+    max_io=$(awk -F',' -v c="$idx_io" 'NR>1 && c>0{if($c>m)m=$c} END{print m+0}' "$TS_CSV")
+    low_conn=$(awk -F',' -v c="$idx_conn" 'NR>1 && c>0 && ($c=="" || $c+0<3){d++} END{print d+0}' "$TS_CSV")
+    lagging=$(awk -F',' -v b="$idx_blocks" -v h="$idx_headers" 'NR>1 && b>0 && h>0 && $b!="" && $h!="" && ($h-$b)>3 {d++} END{print d+0}' "$TS_CSV")
+    high_ping=$(awk -F',' -v c="$idx_highping" 'NR>1 && c>0 && $c!="" && $c+0>0 {d++} END{print d+0}' "$TS_CSV")
+    ntp_bad=$(awk -F',' -v c="$idx_ntp" 'NR>1 && c>0 && $c!="" && ($c+0>200 || $c+0<-200) {d++} END{print d+0}' "$TS_CSV")
+    psi_mem_bad=$(awk -F',' -v c="$idx_psi_mem" 'NR>1 && c>0 && $c!="" && $c+0>1 {d++} END{print d+0}' "$TS_CSV")
+    restart_samples=$(awk -F',' -v c="$idx_restarts" 'NR>1 && c>0 && $c!="" && $c+0>0 {d++} END{print d+0}' "$TS_CSV")
+    pose_load=$(awk -F',' -v c1="$idx_load1" -v cp="$idx_pose" 'NR>1 && c1>0 && cp>0 && $cp!="" {if($c1>2.0 && $cp+0>0) d++} END{print d+0}' "$TS_CSV")
+    pose_jumps=$(awk -F',' -v cp="$idx_pose" 'NR>1 && cp>0 {if(prev!="" && $cp>prev+5) d++; prev=$cp} END{print d+0}' "$TS_CSV")
     echo "- Max load1: $max_load"
     echo "- Max defcond CPU %: $max_cpu"
     echo "- Max defcond MEM %: $max_mem"
@@ -523,6 +567,8 @@ score_line(){ score=$((score+$1)); }
     echo "- Samples with significant NTP offset (>200 ms): $ntp_bad"
     echo "- Samples with memory PSI avg10 > 1: $psi_mem_bad"
     echo "- Samples with service restarts > 0: $restart_samples"
+    echo "- Samples with high load and non-zero PoSe penalty: $pose_load"
+    echo "- Significant PoSe penalty jumps (>5): $pose_jumps"
     [ "${max_load%.*}" -ge 3 ] && score_line 2
     [ "$min_mem" -lt 262144 ] && score_line 3
     [ "${max_cpu%.*}" -ge 90 ] && score_line 2
@@ -531,13 +577,9 @@ score_line(){ score=$((score+$1)); }
     [ "$high_ping" -ge 10 ] && score_line 2
     [ "$ntp_bad" -ge 3 ] && score_line 2
     [ "$psi_mem_bad" -ge 3 ] && score_line 3
-    pose_load=$(awk -F',' 'NR>1 && $(NF-12)!="" {if($2>2.0 && $(NF-12)+0>0) c++} END{print c+0}' "$TS_CSV")
-    pose_jumps=$(awk -F',' 'NR>1 {if(prev!="" && $(NF-12)>prev+5) c++; prev=$(NF-12)} END{print c+0}' "$TS_CSV")
-    echo "- Samples with high load and non-zero PoSe penalty: $pose_load"
-    echo "- Significant PoSe penalty jumps (>5): $pose_jumps"
   else
     echo "- No timeseries data found"
-    score_line 2
+    score_line 1
   fi
   echo
   echo "## Risk assessment"
@@ -571,10 +613,19 @@ chmod +x "$ANALYZE_SCRIPT"
 }
 
 generate_report(){ write_analyze_script; mapfile -t generated < <("$ANALYZE_SCRIPT"); log "Reports created:"; printf ' - %s\n' "${generated[@]}"; }
-instant_analysis(){ load_config; out="$REPORT_DIR/instant-analysis-$(date '+%F-%H%M%S').md"; write_instant_analysis "$out"; log "Instant analysis created: $out"; }
-cleanup_all(){ read -r -p "Really delete all inspector data? [yes/NO]: " ans || true; [ "$ans" = "yes" ] || { log "Aborted"; return 0; }; stop_monitor || true; rm -rf "$BASE_DIR"; log "All inspector data removed: $BASE_DIR"; }
-show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; echo "IO test : ${IO_TEST_ENABLED:-$IO_TEST_ENABLED_DEFAULT}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }
+instant_analysis(){ load_config; out="$REPORT_DIR/instant-analysis-$(date '+%F-%H%M%S').md"; write_instant_analysis "$out"; log "Instant analysis created: $out"; echo "Tip: For correlation over time, start logging next with menu 1 / start."; }
+cleanup_all(){ read -r -p "Really delete ALL inspector data, logs and reports? [yes/NO]: " ans || true; [ "$ans" = "yes" ] || { log "Aborted"; return 0; }; stop_monitor || true; rm -rf "$BASE_DIR"; log "All inspector data removed: $BASE_DIR"; }
+show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; echo "IO test : ${IO_TEST_ENABLED:-unset}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }
 selftest(){ load_config; echo "Core commands:"; for c in awk sed grep ps ss systemctl journalctl nohup timeout date df free ip find flock ionice nice; do if have_cmd "$c"; then echo "OK  $c"; else echo "MISS $c"; fi; done; echo; echo "Service:"; systemctl is-active "$SERVICE_NAME" || true; echo; echo "Datadir:"; ls -ld "$DATA_DIR" 2>/dev/null || true; echo; echo "CLI probe:"; timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null | head -n 20 || true; }
+show_workflow(){ cat <<EOF2
+Recommended workflow:
+  1) Run selftest to verify commands, service and datadir.
+  2) Run instant live analysis for a no-history snapshot.
+  3) Start inspection and logging for long-term correlation.
+  4) When a PoSe issue happened, stop everything and generate the report.
+  5) Review reports under: $REPORT_DIR
+EOF2
+}
 
 usage(){ cat <<EOF2
 $APP_NAME v$VERSION
@@ -582,11 +633,12 @@ $APP_NAME v$VERSION
 Menu:
   1) Start inspection and logging
   2) Stop everything and generate report
-  3) Instant analysis now (no prior logging required)
-  4) Cleanup: delete inspector data
+  3) Instant live analysis now (no prior logging required)
+  4) Cleanup: delete inspector data, logs and reports
   5) Show / adjust configuration
   6) Show status
   7) Self test
+  8) Show recommended workflow
 
 Direct usage:
   $0 start
@@ -596,6 +648,7 @@ Direct usage:
   $0 config
   $0 status
   $0 selftest
+  $0 workflow
 EOF2
 }
 
@@ -612,6 +665,7 @@ menu(){
       5) setup_config_interactive ;;
       6) show_status ;;
       7) selftest ;;
+      8) show_workflow ;;
       *) echo "Invalid choice" ;;
     esac
     echo
@@ -626,6 +680,7 @@ case "${1:-}" in
   config)       setup_config_interactive ;;
   status)       show_status ;;
   selftest)     selftest ;;
+  workflow)     show_workflow ;;
   "")           menu ;;
   *)            usage; exit 1 ;;
 esac
