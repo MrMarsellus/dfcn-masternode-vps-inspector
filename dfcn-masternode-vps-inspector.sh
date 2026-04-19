@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="dfcn-masternode-vps-inspector"
-VERSION="0.4.3"
+VERSION="0.4.4"
 BASE_DIR="${HOME}/.${APP_NAME}"
 INSTALL_PATH_DEFAULT="${HOME}/dfcn-masternode-vps-inspector.sh"
 LOG_DIR="${BASE_DIR}/logs"
@@ -92,18 +92,33 @@ load_config(){
   source "$CFG_FILE"
 }
 
+use_default_config(){
+  # lädt ggf. existierende config.env oder schreibt Defaults neu
+  write_default_config
+  load_config
+  echo
+  echo "Using default configuration:"
+  echo "  Service : $SERVICE_NAME"
+  echo "  CLI     : $CLI_BIN"
+  echo "  Daemon  : $DAEMON_BIN"
+  echo "  Datadir : $DATA_DIR"
+  echo "  Config  : $CONF_FILE"
+  echo
+}
+
 prompt_default(){
   local label="$1" default="$2" value
   read -r -p "$label [$default]: " value || true
   if [ -z "${value:-}" ]; then printf '%s' "$default"; else printf '%s' "$value"; fi
 }
 
-setup_config_interactive(){
+configure_interactive(){
   load_config
   echo
   echo "Review / adjust configuration"
   echo "Press Enter to keep the current value shown in brackets."
   echo
+
   SERVICE_NAME="$(prompt_default 'Systemd service name' "$SERVICE_NAME")"
   CLI_BIN="$(prompt_default 'Path to defcon-cli' "$CLI_BIN")"
   DAEMON_BIN="$(prompt_default 'Path to defcond' "$DAEMON_BIN")"
@@ -118,6 +133,7 @@ setup_config_interactive(){
   LOG_LEVEL="$(prompt_default 'Log level (basic|debug)' "$LOG_LEVEL")"
   PROTX_HASH="$(prompt_default 'ProTx hash for PoSe (optional)' "$PROTX_HASH")"
   IO_TEST_ENABLED="$(prompt_default 'Enable lightweight IO latency test? (0/1)' "${IO_TEST_ENABLED:-$IO_TEST_ENABLED_DEFAULT}")"
+
   cat > "$CFG_FILE" <<EOF2
 SERVICE_NAME="$SERVICE_NAME"
 CLI_BIN="$CLI_BIN"
@@ -136,7 +152,32 @@ LOG_LEVEL="$LOG_LEVEL"
 PROTX_HASH="$PROTX_HASH"
 IO_TEST_ENABLED="$IO_TEST_ENABLED"
 EOF2
+
+  echo
   echo "Configuration saved to $CFG_FILE"
+}
+
+setup_config_interactive(){
+  echo
+  echo "Configuration mode:"
+  echo "  1) Use default configuration"
+  echo "  2) Review / adjust configuration interactively"
+  echo
+  read -r -p "Choice [1/2]: " cfg_choice || true
+  cfg_choice="${cfg_choice:-1}"
+
+  case "$cfg_choice" in
+    1)
+      use_default_config
+      ;;
+    2)
+      configure_interactive
+      ;;
+    *)
+      echo "Invalid choice, using default configuration."
+      use_default_config
+      ;;
+  esac
 }
 
 redact_conf(){ sed -E 's/(rpcpassword=).+/\1***REDACTED***/; s/(masternodeblsprivkey=).+/\1***REDACTED***/; s/(rpcuser=).+/\1***REDACTED***/; s/(externalip=).+/\1***REDACTED***/'; }
