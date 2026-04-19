@@ -52,7 +52,11 @@ show_file(){
   local f="$1"
   [ -f "$f" ] || { warn "File not found: $f"; return 1; }
   echo
+  print_line
+  print_line
   echo "Report viewer hint: Use the arrow keys to scroll. Press q to close the view."
+  print_line
+  print_line
   echo
   if have_cmd less; then
     less "$f"
@@ -322,6 +326,10 @@ usage() {
   print_line
   cat <<EOF2
 
+Report viewer hint:
+  When a report is shown, use the arrow keys to scroll.
+  Press q to close the report view and return.
+
 Menu:
   1) Start inspection and logging
   2) Stop everything and generate report
@@ -346,7 +354,6 @@ Recommended install + start:
   curl -fsSL -o "$INSTALL_PATH_DEFAULT" https://raw.githubusercontent.com/MrMarsellus/dfcn-masternode-vps-inspector/main/dfcn-masternode-vps-inspector.sh && chmod +x "$INSTALL_PATH_DEFAULT" && "$INSTALL_PATH_DEFAULT"
 EOF2
 }
-
 menu(){
   while true; do
     usage
