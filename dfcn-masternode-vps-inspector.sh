@@ -294,6 +294,8 @@ show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_D
 selftest() {
   load_config
   {
+    echo "Self test viewer hint: Use the arrow keys to scroll, press q to close."
+    echo
     echo "Core commands:"
     for c in awk sed grep ps ss systemctl journalctl nohup timeout date df free ip find flock ionice nice; do
       if have_cmd "$c"; then
