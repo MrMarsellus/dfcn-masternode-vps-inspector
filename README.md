@@ -10,6 +10,12 @@ Current version: **v0.4.3**
 curl -fsSL -o "$HOME/dfcn-masternode-vps-inspector.sh" https://raw.githubusercontent.com/MrMarsellus/dfcn-masternode-vps-inspector/main/dfcn-masternode-vps-inspector.sh && chmod +x "$HOME/dfcn-masternode-vps-inspector.sh" && "$HOME/dfcn-masternode-vps-inspector.sh"
 ```
 
+## One-liner: reopen inspector
+
+```bash
+"$HOME/dfcn-masternode-vps-inspector.sh"
+```
+
 This downloads the script to the server first and then runs it locally. Review remote scripts before execution if you have security concerns, or download the file first and inspect it locally. 
 
 ## Recommended workflow
