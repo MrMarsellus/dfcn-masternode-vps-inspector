@@ -2,14 +2,14 @@
 set -Eeuo pipefail  # strict error handling
 
 APP_NAME="dfcn-masternode-vps-inspector"
-VERSION="0.3.0"
+VERSION="0.4.0"
 BASE_DIR="${HOME}/.${APP_NAME}"
 LOG_DIR="${BASE_DIR}/logs"
 RUN_DIR="${BASE_DIR}/run"
-REPORT_DIR="${BASE_DIR}/reports}"
+REPORT_DIR="${BASE_DIR}/reports"
 CFG_FILE="${BASE_DIR}/config.env"
 MONITOR_SCRIPT="${BASE_DIR}/monitor.sh"
-ANALYZE_SCRIPT="${BASE_DIR}/analyze.sh}"
+ANALYZE_SCRIPT="${BASE_DIR}/analyze.sh"
 LOCK_FILE="${RUN_DIR}/monitor.lock"
 PID_FILE="${RUN_DIR}/monitor.pid"
 TAIL_PID_FILE="${RUN_DIR}/journal_tail.pid"
@@ -31,6 +31,7 @@ NICE_LEVEL_DEFAULT="10"
 PEER_SAMPLE_MAXKB_DEFAULT="32"
 LOG_LEVEL_DEFAULT="basic"      # basic or debug
 PROTX_HASH_DEFAULT=""          # optional protx hash for pose tracking
+IO_TEST_ENABLED_DEFAULT="1"    # 1 = enable lightweight IO test, 0 = disable
 
 umask 077  # secure file permissions
 mkdir -p "$BASE_DIR" "$LOG_DIR" "$RUN_DIR" "$REPORT_DIR"
@@ -59,6 +60,7 @@ NICE_LEVEL="${NICE_LEVEL_DEFAULT}"
 PEER_SAMPLE_MAXKB="${PEER_SAMPLE_MAXKB_DEFAULT}"
 LOG_LEVEL="${LOG_LEVEL_DEFAULT}"
 PROTX_HASH="${PROTX_HASH_DEFAULT}"
+IO_TEST_ENABLED="${IO_TEST_ENABLED_DEFAULT}"
 EOF2
 }
 
@@ -94,6 +96,7 @@ setup_config_interactive(){
   PEER_SAMPLE_MAXKB="$(prompt_default 'Max KB per peer sample (debug)' "$PEER_SAMPLE_MAXKB")"
   LOG_LEVEL="$(prompt_default 'Log level (basic|debug)' "$LOG_LEVEL")"
   PROTX_HASH="$(prompt_default 'ProTx hash for PoSe (optional)' "$PROTX_HASH")"
+  IO_TEST_ENABLED="$(prompt_default 'Enable lightweight IO latency test? (0/1)' "${IO_TEST_ENABLED:-$IO_TEST_ENABLED_DEFAULT}")"
   cat > "$CFG_FILE" <<EOF2
 SERVICE_NAME="$SERVICE_NAME"
 CLI_BIN="$CLI_BIN"
@@ -110,6 +113,7 @@ NICE_LEVEL="$NICE_LEVEL"
 PEER_SAMPLE_MAXKB="$PEER_SAMPLE_MAXKB"
 LOG_LEVEL="$LOG_LEVEL"
 PROTX_HASH="$PROTX_HASH"
+IO_TEST_ENABLED="$IO_TEST_ENABLED"
 EOF2
   echo "Configuration saved to $CFG_FILE"
 }
@@ -159,7 +163,7 @@ system_snapshot(){
     systemctl cat "$SERVICE_NAME" || true
     echo
     echo "===== PROCESS ====="
-    ps -eo user,pid,ppid,%cpu,%mem,rss,vsz,etimes,stat,comm,args | grep -E 'defcon|PID|defcond' || true
+    ps -eo user,pid,ppid,%cpu,%mem,rss,vsz,etimes,stat,comm,args | grep -E 'defcond|defcon-cli|defcond|^USER' || true
     echo
     echo "===== CONFIG FILES ====="
     [ -f "$CONF_FILE" ] && redact_conf < "$CONF_FILE" || true
@@ -268,19 +272,22 @@ while true; do
   defcond_pid=""; defcond_cpu=0; defcond_mem=0; defcond_rss=0; defcond_threads=0; defcond_fd_count=0
   if [ -n "$proc_line" ]; then
     read -r defcond_pid defcond_cpu defcond_mem defcond_rss defcond_threads <<< "$proc_line"
-    [ -d "/proc/$defcond_pid/fd" ] && defcond_fd_count=$(find "/proc/$defcond_pid/fd" -maxdepth 1 2>/dev/null | wc -l)
+    if [ -d "/proc/$defcond_pid/fd" ]; then
+      defcond_fd_count=$(find "/proc/$defcond_pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+    fi
   fi
 
-  # simple datadir write latency test
-  io_test_file="$DATA_DIR/.dfcn_io_test"
+  # simple optional datadir write latency test (very small file, no global sync)
   io_ms=""
-  start_ns=$(date +%s%N)
-  echo "test" > "$io_test_file" 2>/dev/null || true
-  sync 2>/dev/null || true
-  end_ns=$(date +%s%N)
-  delta_ns=$((end_ns-start_ns))
-  io_ms=$((delta_ns/1000000))  # convert ns to ms
-  rm -f "$io_test_file" 2>/dev/null || true
+  if [ "${IO_TEST_ENABLED:-1}" = "1" ] && [ -w "$DATA_DIR" ]; then
+    io_test_file="$DATA_DIR/.dfcn_io_test"
+    start_ns=$(date +%s%N)
+    printf 'x' > "$io_test_file" 2>/dev/null || true
+    end_ns=$(date +%s%N)
+    delta_ns=$((end_ns-start_ns))
+    io_ms=$((delta_ns/1000000))  # convert ns to ms
+    rm -f "$io_test_file" 2>/dev/null || true
+  fi
 
   chain_blocks=""; headers=""; verificationprogress=""; connections=""; mn_synced=""; mn_state=""
   pose_penalty=""; pose_banheight=""
@@ -319,7 +326,7 @@ while true; do
 
   # append all collected values to timeseries
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$ts" "$load1" "$load5" "$load15" "$cpu_user" "$cpu_system" "$cpu_idle" "$mem_total" "$mem_avail" "$swap_total" "$swap_free" "$root_use" "$datadir_use" "$rx_bytes" "$tx_bytes" "$established" "$defcond_cpu" "$defcond_mem" "$defcond_rss" "$defcond_threads" "$defcond_fd_count" "$io_ms" "${chain_blocks:-}" "${headers:-}" "${verificationprogress:-}" "${connections:-}" "${mn_synced:-}" "${mn_state:-}" "${pose_penalty:-}" "${pose_banheight:-}" >> "$TS_CSV"
+    "$ts" "$load1" "$load5" "$load15" "$cpu_user" "$cpu_system" "$cpu_idle" "$mem_total" "$mem_avail" "$swap_total" "$swap_free" "$root_use" "$datadir_use" "$rx_bytes" "$tx_bytes" "$established" "$defcond_cpu" "$defcond_mem" "$defcond_rss" "$defcond_threads" "$defcond_fd_count" "${io_ms:-}" "${chain_blocks:-}" "${headers:-}" "${verificationprogress:-}" "${connections:-}" "${mn_synced:-}" "${mn_state:-}" "${pose_penalty:-}" "${pose_banheight:-}" >> "$TS_CSV"
 
   # remove old log files based on retention
   find "$LOG_DIR" -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
@@ -373,7 +380,7 @@ while true; do
     [ "$dkg_400_fail" -gt 0 ] && printf '%s,INFO,dkgstats,LLMQ_400_60_fail,%s\n' "$ts" "$dkg_400_fail" >> "$ALERTS_CSV"
 
     # scan for important error/pose patterns
-    for pat in 'pose' 'banned' 'dkg' 'timeout' 'quorum' 'not capable' 'watchdog' 'misbehav' 'fork' 'error' 'failed'; do
+    for pat in 'pose' 'banned' 'dkg ' ' dkg' 'timeout' 'quorum ' ' quorum' 'not capable' 'watchdog' 'misbehav' 'fork' 'error' 'failed'; do
       if printf '%s' "$blob" | grep -qi "$pat"; then
         printf '%s,MEDIUM,rpc,%s,%s\n' "$ts" "$pat" "match found" >> "$ALERTS_CSV"  # log pattern match
       fi
@@ -444,7 +451,7 @@ cat > "$ANALYZE_SCRIPT" <<'EOF2'
 set -Eeuo pipefail
 BASE_DIR="${HOME}/.dfcn-masternode-vps-inspector"
 LOG_DIR="${BASE_DIR}/logs"
-REPORT_DIR="${BASE_DIR}/reports}"
+REPORT_DIR="${BASE_DIR}/reports"
 mkdir -p "$REPORT_DIR"
 TS_CSV="${LOG_DIR}/timeseries.csv"
 ALERTS_CSV="${LOG_DIR}/alerts.csv"
@@ -548,7 +555,7 @@ chmod +x "$ANALYZE_SCRIPT"
 
 generate_report(){ write_analyze_script; mapfile -t generated < <("$ANALYZE_SCRIPT"); log "Reports created:"; printf ' - %s\n' "${generated[@]}"; }  # run analyzer and print report paths
 cleanup_all(){ read -r -p "Really delete all inspector data? [yes/NO]: " ans || true; [ "$ans" = "yes" ] || { log "Aborted"; return 0; }; stop_monitor || true; rm -rf "$BASE_DIR"; log "All inspector data removed: $BASE_DIR"; }  # wipe all data
-show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }  # show current status
+show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; echo "IO test : ${IO_TEST_ENABLED:-$IO_TEST_ENABLED_DEFAULT}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }  # show current status
 selftest(){ load_config; echo "Core commands:"; for c in awk sed grep ps ss systemctl journalctl nohup timeout date df free ip find flock ionice nice; do if have_cmd "$c"; then echo "OK  $c"; else echo "MISS $c"; fi; done; echo; echo "Service:"; systemctl is-active "$SERVICE_NAME" || true; echo; echo "Datadir:"; ls -ld "$DATA_DIR" 2>/dev/null || true; echo; echo "CLI probe:"; timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null | head -n 20 || true; }  # quick environment check
 
 usage(){ cat <<EOF2
