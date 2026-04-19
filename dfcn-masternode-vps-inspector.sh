@@ -48,7 +48,18 @@ have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 press_enter(){ read -r -p "Press Enter to continue..." _ || true; }
 ask_yes_no(){ local prompt="$1" default="${2:-y}" ans; if [ "$default" = "y" ]; then read -r -p "$prompt [Y/n]: " ans || true; ans="${ans:-y}"; else read -r -p "$prompt [y/N]: " ans || true; ans="${ans:-n}"; fi; case "$ans" in y|Y|yes|YES) return 0;; *) return 1;; esac; }
 post_action_menu_prompt(){ ask_yes_no "Return to main menu?" y; }
-show_file(){ local f="$1"; [ -f "$f" ] || { warn "File not found: $f"; return 1; }; if have_cmd less; then less "$f"; else cat "$f"; fi; }
+show_file(){
+  local f="$1"
+  [ -f "$f" ] || { warn "File not found: $f"; return 1; }
+  echo
+  echo "Report viewer hint: Use the arrow keys to scroll. Press q to close the view."
+  echo
+  if have_cmd less; then
+    less "$f"
+  else
+    cat "$f"
+  fi
+}
 
 write_default_config(){
 cat > "$CFG_FILE" <<EOF2
