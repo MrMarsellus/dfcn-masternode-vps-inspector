@@ -2,13 +2,15 @@
 
 Diagnostic and monitoring script for DeFCoN masternodes running on VPS hosts. It collects lightweight system, network, service, journal, and RPC data to help analyze the root causes of PoSe bans, DKG/quorum issues, peer problems, clock drift, service instability, and VPS resource bottlenecks.
 
+Current version: **v0.4.3**
+
 ## One-liner: download & start
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MrMarsellus/dfcn-masternode-vps-inspector/main/dfcn-masternode-vps-inspector.sh)
+curl -fsSL -o "$HOME/dfcn-masternode-vps-inspector.sh" https://raw.githubusercontent.com/MrMarsellus/dfcn-masternode-vps-inspector/main/dfcn-masternode-vps-inspector.sh && chmod +x "$HOME/dfcn-masternode-vps-inspector.sh" && "$HOME/dfcn-masternode-vps-inspector.sh"
 ```
 
-This uses the common “curl + bash” pattern often used for GitHub-hosted shell scripts. Review remote scripts before execution if you have security concerns, or download the file first and inspect it locally.
+This downloads the script to the server first and then runs it locally. Review remote scripts before execution if you have security concerns, or download the file first and inspect it locally. 
 
 ## Recommended workflow
 
@@ -17,6 +19,7 @@ This uses the common “curl + bash” pattern often used for GitHub-hosted shel
 3. Start long-term logging with **Start inspection and logging**.
 4. Let the script run through at least one problematic cycle, ideally until a PoSe event, quorum issue, or service instability occurs.
 5. Use **Stop everything and generate report** to create the final Markdown and text summary.
+6. When prompted, open the generated report directly and then return to the main menu.
 
 ## Features
 
@@ -29,6 +32,9 @@ This uses the common “curl + bash” pattern often used for GitHub-hosted shel
   - Status
   - Self test
   - Show recommended workflow
+- Improved menu flow in v0.4.3:
+  - After actions complete, the script can ask whether it should return to the main menu instead of exiting immediately.
+  - When a report is created, the script can offer to display it immediately.
 - Runs in the background using `nohup`, `nice`, and `ionice`; continues running after SSH/PuTTY is closed.
 - Periodic time series logging to `timeseries.csv`:
   - Host metrics: load, CPU usage, RAM, swap, disk usage (root + datadir), lightweight datadir write latency (ms), TCP connections, RX/TX bytes.
@@ -36,7 +42,7 @@ This uses the common “curl + bash” pattern often used for GitHub-hosted shel
   - Chain/MN metrics: blocks, headers, verification progress, connections, masternode sync/state.
   - PoSe metrics (optional): PoSe penalty and PoSe ban height via `protx info` when a ProTx hash is configured.
   - Peer quality metrics: total peers, inbound peers, outbound peers, average ping, max ping, high-ping peer count.
-  - Time and pressure metrics: NTP offset via `chronyc tracking`, service restart count, PSI CPU/memory/IO pressure values. The `tracking` command is specifically intended to show system clock performance.
+  - Time and pressure metrics: NTP offset via `chronyc tracking`, service restart count, PSI CPU/memory/IO pressure values. The `tracking` command is intended to monitor system clock state and performance.
 - Event sampler for:
   - `getmasternodestatus` / `masternode status`
   - `quorum dkgstatus`
@@ -90,6 +96,19 @@ Main outputs include:
 - `reports/report-*.md`
 - `reports/summary-*.txt`
 
+## Direct usage
+
+After downloading the script once, you can also call it directly:
+
+```bash
+$HOME/dfcn-masternode-vps-inspector.sh
+$HOME/dfcn-masternode-vps-inspector.sh start
+$HOME/dfcn-masternode-vps-inspector.sh stop-report
+$HOME/dfcn-masternode-vps-inspector.sh analyze-now
+$HOME/dfcn-masternode-vps-inspector.sh status
+$HOME/dfcn-masternode-vps-inspector.sh selftest
+```
+
 ## Notes
 
 - The script does **not** modify any DeFCoN configuration and does **not** run aggressive load or stress tests. Its purpose is to observe, not to stress the node or VPS.
@@ -98,11 +117,11 @@ Main outputs include:
   - configure your ProTx hash so PoSe penalty and ban height can be tracked over time;
   - let the inspector run across at least one full problematic cycle;
   - correlate PoSe events with peer count/quality, header lag, clock drift, restarts, PSI pressure, and service logs.
-- If `chronyc` or `jq` is not installed, the script still works with reduced detail or fallback parsing. The `chronyc` command is the standard CLI for monitoring `chronyd` and inspecting clock tracking state.
+- If `chronyc` or `jq` is not installed, the script still works with reduced detail or fallback parsing. `chronyc` is the standard command-line interface for monitoring `chronyd` and inspecting clock tracking state.
 
 ## Security note
 
-If you do not want to execute a remote script directly, use this safer review flow instead:
+If you do not want to execute the downloaded file immediately, use this review flow instead:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/MrMarsellus/dfcn-masternode-vps-inspector/main/dfcn-masternode-vps-inspector.sh
@@ -110,4 +129,4 @@ less dfcn-masternode-vps-inspector.sh
 bash dfcn-masternode-vps-inspector.sh
 ```
 
-This lets you inspect the script before running it.
+This lets you inspect the script locally before running it.
