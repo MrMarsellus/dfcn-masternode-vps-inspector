@@ -102,6 +102,8 @@ setup_config_interactive(){
   load_config
   echo
   echo "Review / adjust configuration"
+  echo "Press Enter to keep the current value shown in brackets."
+  echo
   SERVICE_NAME="$(prompt_default 'Systemd service name' "$SERVICE_NAME")"
   CLI_BIN="$(prompt_default 'Path to defcon-cli' "$CLI_BIN")"
   DAEMON_BIN="$(prompt_default 'Path to defcond' "$DAEMON_BIN")"
