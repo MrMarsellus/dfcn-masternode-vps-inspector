@@ -2,7 +2,7 @@
 set -Eeuo pipefail  # strict error handling
 
 APP_NAME="dfcn-masternode-vps-inspector"
-VERSION="0.4.0"
+VERSION="0.4.1"
 BASE_DIR="${HOME}/.${APP_NAME}"
 LOG_DIR="${BASE_DIR}/logs"
 RUN_DIR="${BASE_DIR}/run"
@@ -10,6 +10,7 @@ REPORT_DIR="${BASE_DIR}/reports"
 CFG_FILE="${BASE_DIR}/config.env"
 MONITOR_SCRIPT="${BASE_DIR}/monitor.sh"
 ANALYZE_SCRIPT="${BASE_DIR}/analyze.sh"
+EVENT_SCRIPT="${BASE_DIR}/event-sampler.sh"
 LOCK_FILE="${RUN_DIR}/monitor.lock"
 PID_FILE="${RUN_DIR}/monitor.pid"
 TAIL_PID_FILE="${RUN_DIR}/journal_tail.pid"
@@ -22,8 +23,8 @@ DAEMON_BIN_DEFAULT="/usr/local/bin/defcond"
 DATA_DIR_DEFAULT="/home/defcon/.defcon"
 CONF_FILE_DEFAULT="/home/defcon/.defcon/defcon.conf"
 NODE_USER_DEFAULT="defcon"
-INTERVAL_DEFAULT="60"
-EVENT_INTERVAL_DEFAULT="20"
+INTERVAL_DEFAULT="120"
+EVENT_INTERVAL_DEFAULT="60"
 JOURNAL_LINES_DEFAULT="400"
 RETENTION_DAYS_DEFAULT="21"
 IONICE_CLASS_DEFAULT="3"
@@ -36,14 +37,13 @@ IO_TEST_ENABLED_DEFAULT="1"    # 1 = enable lightweight IO test, 0 = disable
 umask 077  # secure file permissions
 mkdir -p "$BASE_DIR" "$LOG_DIR" "$RUN_DIR" "$REPORT_DIR"
 
-log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }               # generic log message
-warn(){ printf '[%s] WARN: %s\n' "$(date '+%F %T')" "$*" >&2; }    # warning log
-err(){ printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }    # error log
-require_cmd(){ command -v "$1" >/dev/null 2>&1 || { err "Required command missing: $1"; exit 1; }; }  # ensure required binary exists
-have_cmd(){ command -v "$1" >/dev/null 2>&1; }                     # check if binary exists
+log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn(){ printf '[%s] WARN: %s\n' "$(date '+%F %T')" "$*" >&2; }
+err(){ printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || { err "Required command missing: $1"; exit 1; }; }
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 write_default_config(){
-  # write initial default config file
 cat > "$CFG_FILE" <<EOF2
 SERVICE_NAME="${SERVICE_NAME_DEFAULT}"
 CLI_BIN="${CLI_BIN_DEFAULT}"
@@ -65,21 +65,18 @@ EOF2
 }
 
 load_config(){
-  # load existing config or create default
   [ -f "$CFG_FILE" ] || write_default_config
   # shellcheck disable=SC1090
   source "$CFG_FILE"
 }
 
 prompt_default(){
-  # read value with default fallback
   local label="$1" default="$2" value
   read -r -p "$label [$default]: " value || true
   if [ -z "${value:-}" ]; then printf '%s' "$default"; else printf '%s' "$value"; fi
 }
 
 setup_config_interactive(){
-  # interactive configuration wizard
   load_config
   echo
   echo "Review / adjust configuration"
@@ -119,12 +116,10 @@ EOF2
 }
 
 redact_conf(){
-  # hide sensitive values from defcon.conf
   sed -E 's/(rpcpassword=).+/\1***REDACTED***/; s/(masternodeblsprivkey=).+/\1***REDACTED***/; s/(rpcuser=).+/\1***REDACTED***/; s/(externalip=).+/\1***REDACTED***/'
 }
 
 system_snapshot(){
-  # capture static system snapshot at start
   local out="$1"
   {
     echo "===== BASIC ====="
@@ -152,6 +147,14 @@ system_snapshot(){
     ip route || true
     ss -tulpn || true
     echo
+    echo "===== TIME SYNC ====="
+    timedatectl 2>/dev/null || true
+    chronyc tracking 2>/dev/null || true
+    chronyc sources -v 2>/dev/null || true
+    echo
+    echo "===== PRESSURE STALL INFO ====="
+    for f in /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io; do [ -r "$f" ] && echo "--- $f ---" && cat "$f"; done
+    echo
     echo "===== SYSCTL FOCUS ====="
     sysctl vm.swappiness vm.dirty_ratio vm.dirty_background_ratio net.core.somaxconn net.ipv4.tcp_syn_retries 2>/dev/null || true
     echo
@@ -161,9 +164,13 @@ system_snapshot(){
     echo "===== SERVICE ====="
     systemctl status "$SERVICE_NAME" --no-pager || true
     systemctl cat "$SERVICE_NAME" || true
+    systemctl show "$SERVICE_NAME" -p NRestarts -p ExecMainPID -p ExecMainStatus -p ExecMainStartTimestampMonotonic -p ActiveEnterTimestamp --no-pager 2>/dev/null || true
     echo
     echo "===== PROCESS ====="
-    ps -eo user,pid,ppid,%cpu,%mem,rss,vsz,etimes,stat,comm,args | grep -E 'defcond|defcon-cli|defcond|^USER' || true
+    ps -eo user,pid,ppid,%cpu,%mem,rss,vsz,etimes,stat,comm,args | grep -E 'defcond|defcon-cli|^USER' || true
+    echo
+    echo "===== KERNEL / OOM HINTS ====="
+    dmesg -T 2>/dev/null | grep -iE 'out of memory|oom|killed process' | tail -n 50 || true
     echo
     echo "===== CONFIG FILES ====="
     [ -f "$CONF_FILE" ] && redact_conf < "$CONF_FILE" || true
@@ -176,7 +183,6 @@ system_snapshot(){
 }
 
 collect_cli_snapshot(){
-  # capture static CLI snapshot at start
   local out="$1"
   {
     echo "===== CLI SNAPSHOT ====="
@@ -187,12 +193,20 @@ collect_cli_snapshot(){
       echo
       timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>&1 || true
       echo
+      timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getchaintips 2>&1 || true
+      echo
+      timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getbestblockhash 2>&1 || true
+      echo
       timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getmasternodestatus 2>&1 || true
       echo
       timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" masternode status 2>&1 || true
       echo
       timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" protx list valid 1 2>&1 || true
       echo
+      if [ -n "${PROTX_HASH:-}" ]; then
+        timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" protx info "$PROTX_HASH" 2>&1 || true
+        echo
+      fi
       timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" quorum list 2>&1 || true
       echo
       timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" quorum dkgstatus 2>&1 || true
@@ -205,7 +219,6 @@ collect_cli_snapshot(){
 }
 
 write_monitor_script(){
-  # write the main background monitor script
 cat > "$MONITOR_SCRIPT" <<'EOF2'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -217,67 +230,42 @@ mkdir -p "$LOG_DIR" "$RUN_DIR"
 # shellcheck disable=SC1090
 source "$CFG_FILE"
 exec 9>"${RUN_DIR}/monitor.lock"
-flock -n 9 || { echo "monitor already running"; exit 1; }  # prevent double monitor
+flock -n 9 || { echo "monitor already running"; exit 1; }
 echo $$ > "${RUN_DIR}/monitor.pid"
 TS_CSV="${LOG_DIR}/timeseries.csv"
 PEER_LOG="${LOG_DIR}/peer-samples.log"
 QUORUM_LOG="${LOG_DIR}/quorum-samples.log"
-
-# create timeseries file with header
-if [ ! -f "$TS_CSV" ]; then
-  echo "timestamp,load1,load5,load15,cpu_user,cpu_system,cpu_idle,mem_total_kb,mem_avail_kb,swap_total_kb,swap_free_kb,root_use_pct,datadir_use_pct,rx_bytes,tx_bytes,established_conns,defcond_cpu_pct,defcond_mem_pct,defcond_rss_kb,defcond_threads,defcond_fd_count,io_ms,chain_blocks,headers,verificationprogress,connections,mn_synced,mn_state,pose_penalty,pose_banheight" > "$TS_CSV"
-fi
-
-cleanup(){ rm -f "${RUN_DIR}/monitor.pid"; }  # remove pid file on exit
+[ -f "$TS_CSV" ] || echo "timestamp,load1,load5,load15,cpu_user,cpu_system,cpu_idle,mem_total_kb,mem_avail_kb,swap_total_kb,swap_free_kb,root_use_pct,datadir_use_pct,rx_bytes,tx_bytes,established_conns,defcond_cpu_pct,defcond_mem_pct,defcond_rss_kb,defcond_threads,defcond_fd_count,io_ms,chain_blocks,headers,verificationprogress,connections,mn_synced,mn_state,pose_penalty,pose_banheight,peer_total,peer_inbound,peer_outbound,peer_ping_avg_ms,peer_ping_max_ms,peer_high_ping_count,ntp_offset_ms,service_restarts,psi_cpu_some_avg10,psi_mem_some_avg10,psi_io_some_avg10" > "$TS_CSV"
+cleanup(){ rm -f "${RUN_DIR}/monitor.pid"; }
 trap cleanup EXIT
-
-get_cpu(){ awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9,$10}' /proc/stat; }  # read cpu counters
+get_cpu(){ awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9,$10}' /proc/stat; }
 read -r u1 n1 s1 i1 w1 irq1 sirq1 st1 g1 < <(get_cpu)
 sleep 1
 read -r u2 n2 s2 i2 w2 irq2 sirq2 st2 g2 < <(get_cpu)
-
+psi_avg10(){ awk -F'[ =]' '/some/ {for(i=1;i<=NF;i++) if($i=="avg10") print $(i+1)}' "$1" 2>/dev/null | head -n1; }
 while true; do
-  ts="$(date '+%F %T')"  # timestamp
+  ts="$(date '+%F %T')"
   read -r load1 load5 load15 _ < /proc/loadavg
-
-  # compute cpu usage delta
   total1=$((u1+n1+s1+i1+w1+irq1+sirq1+st1+g1)); total2=$((u2+n2+s2+i2+w2+irq2+sirq2+st2+g2))
   idle1=$((i1+w1)); idle2=$((i2+w2)); dt=$((total2-total1)); di=$((idle2-idle1)); den=$((dt==0?1:dt))
   cpu_idle=$((100*di/den)); cpu_user=$((100*((u2-u1)+(n2-n1))/den)); cpu_system=$((100*((s2-s1)+(irq2-irq1)+(sirq2-sirq1))/den))
   read -r u1 n1 s1 i1 w1 irq1 sirq1 st1 g1 <<< "$u2 $n2 $s2 $i2 $w2 $irq2 $sirq2 $st2 $g2"
   sleep 1
   read -r u2 n2 s2 i2 w2 irq2 sirq2 st2 g2 < <(get_cpu)
-
-  # read memory and swap
   mem_total=$(awk '/MemTotal:/{print $2}' /proc/meminfo); mem_avail=$(awk '/MemAvailable:/{print $2}' /proc/meminfo)
   swap_total=$(awk '/SwapTotal:/{print $2}' /proc/meminfo); swap_free=$(awk '/SwapFree:/{print $2}' /proc/meminfo)
-
-  # read disk usage
   root_use=$(df -P / | awk 'NR==2{gsub(/%/,"",$5);print $5}')
   datadir_use=$(df -P "$DATA_DIR" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}'); [ -z "$datadir_use" ] && datadir_use="$root_use"
-
-  # read network bytes for default route iface
   iface=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
   rx_bytes=0; tx_bytes=0
-  if [ -n "${iface:-}" ] && [ -r "/sys/class/net/$iface/statistics/rx_bytes" ]; then
-    rx_bytes=$(cat "/sys/class/net/$iface/statistics/rx_bytes")
-    tx_bytes=$(cat "/sys/class/net/$iface/statistics/tx_bytes")
-  fi
-
-  # count tcp established connections
+  if [ -n "${iface:-}" ] && [ -r "/sys/class/net/$iface/statistics/rx_bytes" ]; then rx_bytes=$(cat "/sys/class/net/$iface/statistics/rx_bytes"); tx_bytes=$(cat "/sys/class/net/$iface/statistics/tx_bytes"); fi
   established=$(ss -tan 2>/dev/null | awk 'NR>1 && $1=="ESTAB"{c++} END{print c+0}')
-
-  # read defcond process stats
   proc_line=$(ps -C "$(basename "$DAEMON_BIN")" -o pid=,%cpu=,%mem=,rss=,nlwp= 2>/dev/null | head -n1 | xargs)
   defcond_pid=""; defcond_cpu=0; defcond_mem=0; defcond_rss=0; defcond_threads=0; defcond_fd_count=0
   if [ -n "$proc_line" ]; then
     read -r defcond_pid defcond_cpu defcond_mem defcond_rss defcond_threads <<< "$proc_line"
-    if [ -d "/proc/$defcond_pid/fd" ]; then
-      defcond_fd_count=$(find "/proc/$defcond_pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
-    fi
+    [ -d "/proc/$defcond_pid/fd" ] && defcond_fd_count=$(find "/proc/$defcond_pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
   fi
-
-  # simple optional datadir write latency test (very small file, no global sync)
   io_ms=""
   if [ "${IO_TEST_ENABLED:-1}" = "1" ] && [ -w "$DATA_DIR" ]; then
     io_test_file="$DATA_DIR/.dfcn_io_test"
@@ -285,50 +273,51 @@ while true; do
     printf 'x' > "$io_test_file" 2>/dev/null || true
     end_ns=$(date +%s%N)
     delta_ns=$((end_ns-start_ns))
-    io_ms=$((delta_ns/1000000))  # convert ns to ms
+    io_ms=$((delta_ns/1000000))
     rm -f "$io_test_file" 2>/dev/null || true
   fi
-
-  chain_blocks=""; headers=""; verificationprogress=""; connections=""; mn_synced=""; mn_state=""
-  pose_penalty=""; pose_banheight=""
-
+  chain_blocks=""; headers=""; verificationprogress=""; connections=""; mn_synced=""; mn_state=""; pose_penalty=""; pose_banheight=""
+  peer_total=""; peer_inbound=""; peer_outbound=""; peer_ping_avg_ms=""; peer_ping_max_ms=""; peer_high_ping_count=""
+  ntp_offset_ms=""; service_restarts=""; psi_cpu_some_avg10=""; psi_mem_some_avg10=""; psi_io_some_avg10=""
+  psi_cpu_some_avg10=$(psi_avg10 /proc/pressure/cpu); psi_mem_some_avg10=$(psi_avg10 /proc/pressure/memory); psi_io_some_avg10=$(psi_avg10 /proc/pressure/io)
+  service_restarts=$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null || true)
+  if have_cmd chronyc; then
+    ntp_offset_ms=$(chronyc tracking 2>/dev/null | awk -F':' '/System time/{gsub(/^[[:space:]]+| seconds.*/ ,"",$2); print ($2*1000)}' | head -n1)
+  fi
   if [ -x "$CLI_BIN" ]; then
-    # read blockchain and network info
-    info=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null || true)  # blockchain info snapshot
-    net=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getnetworkinfo 2>/dev/null || true)      # network info snapshot
-    mn=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getmasternodestatus 2>/dev/null || timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" masternode status 2>/dev/null || true)  # masternode status snapshot
-
+    info=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null || true)
+    net=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getnetworkinfo 2>/dev/null || true)
+    mn=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getmasternodestatus 2>/dev/null || timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" masternode status 2>/dev/null || true)
+    peers_json=$(timeout 30 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>/dev/null || true)
     chain_blocks=$(printf '%s' "$info" | sed -n 's/.*"blocks"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
     headers=$(printf '%s' "$info" | sed -n 's/.*"headers"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
     verificationprogress=$(printf '%s' "$info" | sed -n 's/.*"verificationprogress"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p' | head -n1)
     connections=$(printf '%s' "$net" | sed -n 's/.*"connections"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
     mn_synced=$(printf '%s' "$mn" | sed -n 's/.*"IsSynced"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | tr -d ' ' | head -n1)
-    mn_state=$(printf '%s' "$mn" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)  # parse masternode state
+    mn_state=$(printf '%s' "$mn" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
     [ -z "$mn_state" ] && mn_state=$(printf '%s' "$mn" | tr '\n' ' ' | sed 's/,/;/g; s/"//g' | cut -c1-220)
-
-    # fetch protx info for pose tracking
     if [ -n "${PROTX_HASH:-}" ]; then
       protx_info=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" protx info "$PROTX_HASH" 2>/dev/null || true)
-      pose_penalty=$(printf '%s' "$protx_info" | sed -n 's/.*"PoSePenalty"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n1)  # parse pose penalty
-      pose_banheight=$(printf '%s' "$protx_info" | sed -n 's/.*"PoSeBanHeight"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n1)  # parse pose ban height
+      pose_penalty=$(printf '%s' "$protx_info" | sed -n 's/.*"PoSePenalty"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n1)
+      pose_banheight=$(printf '%s' "$protx_info" | sed -n 's/.*"PoSeBanHeight"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n1)
     fi
-
-    # optional verbose peer/quorum snapshots
+    peer_total=$(printf '%s' "$peers_json" | grep -c '"addr"')
+    peer_inbound=$(printf '%s' "$peers_json" | grep -c '"inbound"[[:space:]]*:[[:space:]]*true')
+    peer_outbound=$(printf '%s' "$peers_json" | grep -c '"inbound"[[:space:]]*:[[:space:]]*false')
+    peer_ping_avg_ms=$(printf '%s' "$peers_json" | awk '/"pingtime"/{gsub(/[,]/,""); sum+=$2; n++} END{if(n>0) printf "%.2f", sum*1000/n}')
+    peer_ping_max_ms=$(printf '%s' "$peers_json" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>m)m=$2} END{if(m>0) printf "%.2f", m*1000}')
+    peer_high_ping_count=$(printf '%s' "$peers_json" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>0.8)c++} END{print c+0}')
     if [ "${LOG_LEVEL:-basic}" = "debug" ]; then
       printf '%s | getpeerinfo\n' "$ts" >> "$PEER_LOG"
-      timeout 30 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>/dev/null | head -c "$((PEER_SAMPLE_MAXKB*1024))" >> "$PEER_LOG" || true
+      printf '%s' "$peers_json" | head -c "$((PEER_SAMPLE_MAXKB*1024))" >> "$PEER_LOG" || true
       printf '\n\n' >> "$PEER_LOG"
       printf '%s | quorum dkgstatus\n' "$ts" >> "$QUORUM_LOG"
       timeout 30 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" quorum dkgstatus 2>/dev/null >> "$QUORUM_LOG" || true
       printf '\n\n' >> "$QUORUM_LOG"
-    fi  # debug logging only
+    fi
   fi
-
-  # append all collected values to timeseries
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$ts" "$load1" "$load5" "$load15" "$cpu_user" "$cpu_system" "$cpu_idle" "$mem_total" "$mem_avail" "$swap_total" "$swap_free" "$root_use" "$datadir_use" "$rx_bytes" "$tx_bytes" "$established" "$defcond_cpu" "$defcond_mem" "$defcond_rss" "$defcond_threads" "$defcond_fd_count" "${io_ms:-}" "${chain_blocks:-}" "${headers:-}" "${verificationprogress:-}" "${connections:-}" "${mn_synced:-}" "${mn_state:-}" "${pose_penalty:-}" "${pose_banheight:-}" >> "$TS_CSV"
-
-  # remove old log files based on retention
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$ts" "$load1" "$load5" "$load15" "$cpu_user" "$cpu_system" "$cpu_idle" "$mem_total" "$mem_avail" "$swap_total" "$swap_free" "$root_use" "$datadir_use" "$rx_bytes" "$tx_bytes" "$established" "$defcond_cpu" "$defcond_mem" "$defcond_rss" "$defcond_threads" "$defcond_fd_count" "${io_ms:-}" "${chain_blocks:-}" "${headers:-}" "${verificationprogress:-}" "${connections:-}" "${mn_synced:-}" "${mn_state:-}" "${pose_penalty:-}" "${pose_banheight:-}" "${peer_total:-}" "${peer_inbound:-}" "${peer_outbound:-}" "${peer_ping_avg_ms:-}" "${peer_ping_max_ms:-}" "${peer_high_ping_count:-}" "${ntp_offset_ms:-}" "${service_restarts:-}" "${psi_cpu_some_avg10:-}" "${psi_mem_some_avg10:-}" "${psi_io_some_avg10:-}" >> "$TS_CSV"
   find "$LOG_DIR" -type f -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
   sleep "$INTERVAL"
 done
@@ -337,8 +326,7 @@ chmod +x "$MONITOR_SCRIPT"
 }
 
 write_event_sampler(){
-  # write the RPC/journal event sampler script
-cat > "${BASE_DIR}/event-sampler.sh" <<'EOF2'
+cat > "$EVENT_SCRIPT" <<'EOF2'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 BASE_DIR="${HOME}/.dfcn-masternode-vps-inspector"
@@ -353,53 +341,43 @@ POSE_LOG="${LOG_DIR}/pose-events.log"
 ALERTS_CSV="${LOG_DIR}/alerts.csv"
 [ -f "$ALERTS_CSV" ] || echo 'timestamp,severity,source,pattern,details' > "$ALERTS_CSV"
 trap 'rm -f "${RUN_DIR}/event_sampler.pid"' EXIT
-
 while true; do
-  ts="$(date '+%F %T')"  # timestamp
+  ts="$(date '+%F %T')"
   svc=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)
-  [ "$svc" != "active" ] && printf '%s,HIGH,systemd,service_inactive,%s\n' "$ts" "$svc" >> "$ALERTS_CSV"  # log inactive service
-
+  [ "$svc" != "active" ] && printf '%s,HIGH,systemd,service_inactive,%s\n' "$ts" "$svc" >> "$ALERTS_CSV"
+  restarts=$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null || true)
+  [ -n "$restarts" ] && [ "$restarts" -gt 0 ] 2>/dev/null && printf '%s,INFO,systemd,restarts,%s\n' "$ts" "$restarts" >> "$ALERTS_CSV"
   if [ -x "$CLI_BIN" ]; then
-    mn=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getmasternodestatus 2>/dev/null || timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" masternode status 2>/dev/null || true)  # masternode status
-    quorum=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" quorum dkgstatus 2>/dev/null || true)  # quorum dkgstatus
-    peers=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>/dev/null || true)  # peer info
-
-    printf '===== %s =====\n[Masternode]\n%s\n\n[Quorum]\n%s\n\n' "$ts" "$mn" "$quorum" >> "$EVENT_LOG"
-
-    blob="$(printf '%s\n%s\n%s' "$mn" "$quorum" "$peers")"
-
-    # simple dkg failure counts per llmq type
+    mn=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getmasternodestatus 2>/dev/null || timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" masternode status 2>/dev/null || true)
+    quorum=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" quorum dkgstatus 2>/dev/null || true)
+    peers=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>/dev/null || true)
+    tips=$(timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getchaintips 2>/dev/null || true)
+    printf '===== %s =====\n[Masternode]\n%s\n\n[Quorum]\n%s\n\n[ChainTips]\n%s\n\n' "$ts" "$mn" "$quorum" "$tips" >> "$EVENT_LOG"
+    blob="$(printf '%s\n%s\n%s\n%s' "$mn" "$quorum" "$peers" "$tips")"
     dkg_50_fail=$(printf '%s' "$quorum" | grep -c 'LLMQ_50_60.*"failed": true')
     dkg_60_fail=$(printf '%s' "$quorum" | grep -c 'LLMQ_60_75.*"failed": true')
     dkg_100_fail=$(printf '%s' "$quorum" | grep -c 'LLMQ_100_67.*"failed": true')
     dkg_400_fail=$(printf '%s' "$quorum" | grep -c 'LLMQ_400_60.*"failed": true')
-
     [ "$dkg_50_fail" -gt 0 ] && printf '%s,INFO,dkgstats,LLMQ_50_60_fail,%s\n' "$ts" "$dkg_50_fail" >> "$ALERTS_CSV"
     [ "$dkg_60_fail" -gt 0 ] && printf '%s,INFO,dkgstats,LLMQ_60_75_fail,%s\n' "$ts" "$dkg_60_fail" >> "$ALERTS_CSV"
     [ "$dkg_100_fail" -gt 0 ] && printf '%s,INFO,dkgstats,LLMQ_100_67_fail,%s\n' "$ts" "$dkg_100_fail" >> "$ALERTS_CSV"
     [ "$dkg_400_fail" -gt 0 ] && printf '%s,INFO,dkgstats,LLMQ_400_60_fail,%s\n' "$ts" "$dkg_400_fail" >> "$ALERTS_CSV"
-
-    # scan for important error/pose patterns
-    for pat in 'pose' 'banned' 'dkg ' ' dkg' 'timeout' 'quorum ' ' quorum' 'not capable' 'watchdog' 'misbehav' 'fork' 'error' 'failed'; do
-      if printf '%s' "$blob" | grep -qi "$pat"; then
-        printf '%s,MEDIUM,rpc,%s,%s\n' "$ts" "$pat" "match found" >> "$ALERTS_CSV"  # log pattern match
-      fi
+    for pat in 'pose' 'banned' 'timeout' 'quorum' 'not capable' 'watchdog' 'misbehav' 'fork' 'headers' 'invalid' 'error' 'failed'; do
+      if printf '%s' "$blob" | grep -qi "$pat"; then printf '%s,MEDIUM,rpc,%s,%s\n' "$ts" "$pat" "match found" >> "$ALERTS_CSV"; fi
     done
-
-    # keep focused PoSe-related snippets
-    if printf '%s' "$blob" | grep -qiE 'pose|banned'; then
-      printf '===== %s =====\n%s\n\n%s\n\n' "$ts" "$mn" "$quorum" >> "$POSE_LOG"  # log pose-related detail
-    fi
+    if printf '%s' "$blob" | grep -qiE 'pose|banned'; then printf '===== %s =====\n%s\n\n%s\n\n%s\n\n' "$ts" "$mn" "$quorum" "$tips" >> "$POSE_LOG"; fi
   fi
-
+  if have_cmd chronyc; then
+    chronyc tracking 2>/dev/null | awk -v ts="$ts" -F':' '/System time/ {gsub(/^[[:space:]]+| seconds.*/,"",$2); v=$2*1000; if (v>200 || v<-200) printf "%s,MEDIUM,ntp,offset_ms,%s\n", ts, v }' >> "$ALERTS_CSV" || true
+  fi
+  dmesg -T 2>/dev/null | grep -iE 'out of memory|oom|killed process' | tail -n 1 | awk -v ts="$ts" 'NF{printf "%s,HIGH,kernel,oom,%s\n", ts, $0}' >> "$ALERTS_CSV" || true
   sleep "$EVENT_INTERVAL"
 done
 EOF2
-chmod +x "${BASE_DIR}/event-sampler.sh"
+chmod +x "$EVENT_SCRIPT"
 }
 
 start_journal_follow(){
-  # start journalctl -f for the service
   load_config
   if [ -f "$TAIL_PID_FILE" ] && kill -0 "$(cat "$TAIL_PID_FILE")" 2>/dev/null; then return 0; fi
   nohup bash -c "journalctl -u '$SERVICE_NAME' -f -o short-iso >> '$LOG_DIR/journal-follow.log' 2>&1" >/dev/null 2>&1 &
@@ -407,15 +385,13 @@ start_journal_follow(){
 }
 
 start_event_sampler(){
-  # start the event sampler in background
   write_event_sampler
   if [ -f "$EVENT_PID_FILE" ] && kill -0 "$(cat "$EVENT_PID_FILE")" 2>/dev/null; then return 0; fi
-  nohup ionice -c "$IONICE_CLASS" nice -n "$NICE_LEVEL" "${BASE_DIR}/event-sampler.sh" >> "$LOG_DIR/event-sampler-stdout.log" 2>&1 &
+  nohup ionice -c "$IONICE_CLASS" nice -n "$NICE_LEVEL" "$EVENT_SCRIPT" >> "$LOG_DIR/event-sampler-stdout.log" 2>&1 &
   sleep 1
 }
 
 start_monitor(){
-  # start full monitoring stack: monitor + journal + events
   load_config
   for c in systemctl journalctl ps ss awk sed grep timeout date df free ip nohup find flock; do require_cmd "$c"; done
   [ -x "$CLI_BIN" ] || warn "CLI not found or not executable: $CLI_BIN"
@@ -434,7 +410,6 @@ start_monitor(){
 }
 
 stop_monitor(){
-  # stop all background processes
   for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do
     if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then
       kill "$(cat "$f")" || true; sleep 1; kill -9 "$(cat "$f")" 2>/dev/null || true
@@ -444,8 +419,64 @@ stop_monitor(){
   log "All background processes stopped"
 }
 
+write_instant_analysis(){
+  load_config
+  local out="$1"
+  {
+    echo "# Instant analysis"
+    echo
+    echo "Generated: $(date -Is)"
+    echo
+    echo "## Quick verdict"
+    echo "This instant analysis works even if long-term logging has never been started. It is a point-in-time diagnostic snapshot only."
+    echo
+    echo "## Service"
+    systemctl is-active "$SERVICE_NAME" 2>/dev/null || true
+    systemctl show "$SERVICE_NAME" -p NRestarts -p ExecMainPID -p ExecMainStatus --no-pager 2>/dev/null || true
+    echo
+    echo "## Time sync"
+    timedatectl 2>/dev/null || true
+    chronyc tracking 2>/dev/null || true
+    chronyc sources -v 2>/dev/null || true
+    echo
+    echo "## Pressure stall"
+    for f in /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io; do [ -r "$f" ] && echo "--- $f ---" && cat "$f"; done
+    echo
+    echo "## OOM / kernel hints"
+    dmesg -T 2>/dev/null | grep -iE 'out of memory|oom|killed process' | tail -n 30 || true
+    echo
+    echo "## Chain / masternode / quorum"
+    if [ -x "$CLI_BIN" ]; then
+      timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>&1 || true
+      echo
+      timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getnetworkinfo 2>&1 || true
+      echo
+      timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getchaintips 2>&1 || true
+      echo
+      timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getmasternodestatus 2>&1 || timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" masternode status 2>&1 || true
+      echo
+      timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" quorum dkgstatus 2>&1 || true
+      echo
+      if [ -n "${PROTX_HASH:-}" ]; then timeout 20 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" protx info "$PROTX_HASH" 2>&1 || true; fi
+      echo
+      echo "## Peer summary"
+      peers=$(timeout 25 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getpeerinfo 2>/dev/null || true)
+      printf 'total=%s\n' "$(printf '%s' "$peers" | grep -c '"addr"')"
+      printf 'inbound=%s\n' "$(printf '%s' "$peers" | grep -c '"inbound"[[:space:]]*:[[:space:]]*true')"
+      printf 'outbound=%s\n' "$(printf '%s' "$peers" | grep -c '"inbound"[[:space:]]*:[[:space:]]*false')"
+      printf 'avg_ping_ms=%s\n' "$(printf '%s' "$peers" | awk '/"pingtime"/{gsub(/[,]/,""); sum+=$2; n++} END{if(n>0) printf "%.2f", sum*1000/n; else print "n/a"}')"
+      printf 'max_ping_ms=%s\n' "$(printf '%s' "$peers" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>m)m=$2} END{if(m>0) printf "%.2f", m*1000; else print "n/a"}')"
+      printf 'high_ping_count_gt_800ms=%s\n' "$(printf '%s' "$peers" | awk '/"pingtime"/{gsub(/[,]/,""); if($2>0.8)c++} END{print c+0}')"
+    else
+      echo "CLI not found: $CLI_BIN"
+    fi
+    echo
+    echo "## Journal tail"
+    journalctl -u "$SERVICE_NAME" -n "$JOURNAL_LINES" --no-pager 2>/dev/null || true
+  } > "$out" 2>&1
+}
+
 write_analyze_script(){
-  # write analyzer script to generate reports
 cat > "$ANALYZE_SCRIPT" <<'EOF2'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -458,8 +489,7 @@ ALERTS_CSV="${LOG_DIR}/alerts.csv"
 REPORT_MD="${REPORT_DIR}/report-$(date '+%F-%H%M%S').md"
 REPORT_TXT="${REPORT_DIR}/summary-$(date '+%F-%H%M%S').txt"
 score=0
-score_line(){ score=$((score+$1)); }  # accumulate score
-
+score_line(){ score=$((score+$1)); }
 {
   echo "# DFCN Masternode VPS Inspector Report"
   echo
@@ -477,6 +507,10 @@ score_line(){ score=$((score+$1)); }  # accumulate score
     max_io=$(awk -F',' 'NR>1{if($22>m)m=$22} END{print m+0}' "$TS_CSV")
     low_conn=$(awk -F',' 'NR>1 && ($26=="" || $26+0<3){c++} END{print c+0}' "$TS_CSV")
     lagging=$(awk -F',' 'NR>1 && $23!="" && $24!="" && ($24-$23)>3 {c++} END{print c+0}' "$TS_CSV")
+    high_ping=$(awk -F',' 'NR>1 && $36!="" && $36+0>0 {c++} END{print c+0}' "$TS_CSV")
+    ntp_bad=$(awk -F',' 'NR>1 && $37!="" && ($37+0>200 || $37+0<-200) {c++} END{print c+0}' "$TS_CSV")
+    psi_mem_bad=$(awk -F',' 'NR>1 && $40!="" && $40+0>1 {c++} END{print c+0}' "$TS_CSV")
+    restart_samples=$(awk -F',' 'NR>1 && $38!="" && $38+0>0 {c++} END{print c+0}' "$TS_CSV")
     echo "- Max load1: $max_load"
     echo "- Max defcond CPU %: $max_cpu"
     echo "- Max defcond MEM %: $max_mem"
@@ -485,58 +519,42 @@ score_line(){ score=$((score+$1)); }  # accumulate score
     echo "- Min MemAvailable KB: $min_mem"
     echo "- Samples with few connections (<3): $low_conn"
     echo "- Samples with header/block lag > 3: $lagging"
-
+    echo "- Samples with high-ping peers (>800 ms): $high_ping"
+    echo "- Samples with significant NTP offset (>200 ms): $ntp_bad"
+    echo "- Samples with memory PSI avg10 > 1: $psi_mem_bad"
+    echo "- Samples with service restarts > 0: $restart_samples"
     [ "${max_load%.*}" -ge 3 ] && score_line 2
     [ "$min_mem" -lt 262144 ] && score_line 3
     [ "${max_cpu%.*}" -ge 90 ] && score_line 2
     [ "$low_conn" -ge 10 ] && score_line 2
     [ "$lagging" -ge 10 ] && score_line 2
-
-    # events: high load + pose penalty
-    pose_load=$(awk -F',' 'NR>1 && $(NF-1)!="" {if($2>2.0 && $(NF-1)+0>0) c++} END{print c+0}' "$TS_CSV")
-    # count pose jumps > 5
-    pose_jumps=$(awk -F',' 'NR>1 {if(prev!="" && $(NF-1)>prev+5) c++; prev=$(NF-1)} END{print c+0}' "$TS_CSV")
+    [ "$high_ping" -ge 10 ] && score_line 2
+    [ "$ntp_bad" -ge 3 ] && score_line 2
+    [ "$psi_mem_bad" -ge 3 ] && score_line 3
+    pose_load=$(awk -F',' 'NR>1 && $(NF-12)!="" {if($2>2.0 && $(NF-12)+0>0) c++} END{print c+0}' "$TS_CSV")
+    pose_jumps=$(awk -F',' 'NR>1 {if(prev!="" && $(NF-12)>prev+5) c++; prev=$(NF-12)} END{print c+0}' "$TS_CSV")
     echo "- Samples with high load and non-zero PoSe penalty: $pose_load"
     echo "- Significant PoSe penalty jumps (>5): $pose_jumps"
   else
     echo "- No timeseries data found"
-    score_line 5
+    score_line 2
   fi
-
   echo
   echo "## Risk assessment"
-  if [ "$score" -le 2 ]; then
-    echo "- Low: no clear VPS-level resource issues visible."
-  elif [ "$score" -le 5 ]; then
-    echo "- Medium: some resource or connectivity anomalies present."
-  else
-    echo "- High: VPS or node behavior shows strong instability indicators."
-  fi
-
+  if [ "$score" -le 2 ]; then echo "- Low: no clear VPS-level resource issues visible."; elif [ "$score" -le 6 ]; then echo "- Medium: some resource, time-sync, peer-quality, or connectivity anomalies present."; else echo "- High: VPS or node behavior shows strong instability indicators."; fi
   echo
   echo "## Relevant alerts"
-  if [ -f "$ALERTS_CSV" ]; then
-    tail -n 200 "$ALERTS_CSV" | sed 's/^/- /'
-  else
-    echo "- No alerts file found"
-  fi
-
+  if [ -f "$ALERTS_CSV" ]; then tail -n 200 "$ALERTS_CSV" | sed 's/^/- /'; else echo "- No alerts file found"; fi
   echo
   echo "## Journal patterns"
-  if [ -f "${LOG_DIR}/journal-follow.log" ]; then
-    grep -iE 'pose|ban|dkg|quorum|timeout|sync|fork|disconnect|misbehav|error|failed' "${LOG_DIR}/journal-follow.log" | tail -n 300 | sed 's/^/- /' || true
-  else
-    echo "- No journal follow log found"
-  fi
-
+  if [ -f "${LOG_DIR}/journal-follow.log" ]; then grep -iE 'pose|ban|dkg|quorum|timeout|sync|fork|disconnect|misbehav|error|failed|oom' "${LOG_DIR}/journal-follow.log" | tail -n 300 | sed 's/^/- /' || true; else echo "- No journal follow log found"; fi
   echo
   echo "## Recommendations"
-  echo "- Check if PoSe/DKG events correlate with low peers, header lag, high load or low RAM."
-  echo "- If repeated reindex/clean states are needed, review peer quality and possible forked peers first."
-  echo "- Only adjust quorum/PoSe parameters after sufficient measurement and with a clear before/after baseline."
-  echo "- If the host often runs low on RAM or hits high IO latency, test a stronger VPS class."
+  echo "- Correlate PoSe/DKG events with low peers, header lag, NTP offset, service restarts, and memory/IO pressure."
+  echo "- If repeated reindex or cleanup is required, investigate peer quality and possible forked peers before quorum changes."
+  echo "- Treat significant clock drift, OOM hints, and repeated service restarts as first-class suspects."
+  echo "- Only adjust quorum/PoSe parameters after collecting a stable before/after baseline."
 } > "$REPORT_MD"
-
 {
   echo "DFCN short summary"
   echo "Generated: $(date -Is)"
@@ -547,16 +565,16 @@ score_line(){ score=$((score+$1)); }  # accumulate score
   echo
   [ -f "${LOG_DIR}/pose-events.log" ] && echo "Last 80 PoSe-related entries" && tail -n 80 "${LOG_DIR}/pose-events.log"
 } > "$REPORT_TXT"
-
 printf '%s\n%s\n' "$REPORT_MD" "$REPORT_TXT"
 EOF2
 chmod +x "$ANALYZE_SCRIPT"
 }
 
-generate_report(){ write_analyze_script; mapfile -t generated < <("$ANALYZE_SCRIPT"); log "Reports created:"; printf ' - %s\n' "${generated[@]}"; }  # run analyzer and print report paths
-cleanup_all(){ read -r -p "Really delete all inspector data? [yes/NO]: " ans || true; [ "$ans" = "yes" ] || { log "Aborted"; return 0; }; stop_monitor || true; rm -rf "$BASE_DIR"; log "All inspector data removed: $BASE_DIR"; }  # wipe all data
-show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; echo "IO test : ${IO_TEST_ENABLED:-$IO_TEST_ENABLED_DEFAULT}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }  # show current status
-selftest(){ load_config; echo "Core commands:"; for c in awk sed grep ps ss systemctl journalctl nohup timeout date df free ip find flock ionice nice; do if have_cmd "$c"; then echo "OK  $c"; else echo "MISS $c"; fi; done; echo; echo "Service:"; systemctl is-active "$SERVICE_NAME" || true; echo; echo "Datadir:"; ls -ld "$DATA_DIR" 2>/dev/null || true; echo; echo "CLI probe:"; timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null | head -n 20 || true; }  # quick environment check
+generate_report(){ write_analyze_script; mapfile -t generated < <("$ANALYZE_SCRIPT"); log "Reports created:"; printf ' - %s\n' "${generated[@]}"; }
+instant_analysis(){ load_config; out="$REPORT_DIR/instant-analysis-$(date '+%F-%H%M%S').md"; write_instant_analysis "$out"; log "Instant analysis created: $out"; }
+cleanup_all(){ read -r -p "Really delete all inspector data? [yes/NO]: " ans || true; [ "$ans" = "yes" ] || { log "Aborted"; return 0; }; stop_monitor || true; rm -rf "$BASE_DIR"; log "All inspector data removed: $BASE_DIR"; }
+show_status(){ load_config; echo; echo "=== STATUS ==="; echo "Base dir: $BASE_DIR"; echo "Service : $SERVICE_NAME"; echo "CLI     : $CLI_BIN"; echo "Datadir : $DATA_DIR"; echo "LogLevel: ${LOG_LEVEL:-basic}"; echo "ProTx   : ${PROTX_HASH:-}"; echo "IO test : ${IO_TEST_ENABLED:-$IO_TEST_ENABLED_DEFAULT}"; for f in "$PID_FILE" "$TAIL_PID_FILE" "$EVENT_PID_FILE"; do [ -f "$f" ] && echo "$(basename "$f"): $(cat "$f")" || true; done; echo; }
+selftest(){ load_config; echo "Core commands:"; for c in awk sed grep ps ss systemctl journalctl nohup timeout date df free ip find flock ionice nice; do if have_cmd "$c"; then echo "OK  $c"; else echo "MISS $c"; fi; done; echo; echo "Service:"; systemctl is-active "$SERVICE_NAME" || true; echo; echo "Datadir:"; ls -ld "$DATA_DIR" 2>/dev/null || true; echo; echo "CLI probe:"; timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null | head -n 20 || true; }
 
 usage(){ cat <<EOF2
 $APP_NAME v$VERSION
@@ -564,14 +582,16 @@ $APP_NAME v$VERSION
 Menu:
   1) Start inspection and logging
   2) Stop everything and generate report
-  3) Cleanup: delete inspector data
-  4) Show / adjust configuration
-  5) Show status
-  6) Self test
+  3) Instant analysis now (no prior logging required)
+  4) Cleanup: delete inspector data
+  5) Show / adjust configuration
+  6) Show status
+  7) Self test
 
 Direct usage:
   $0 start
   $0 stop-report
+  $0 analyze-now
   $0 cleanup
   $0 config
   $0 status
@@ -580,7 +600,6 @@ EOF2
 }
 
 menu(){
-  # interactive main menu
   while true; do
     usage
     echo
@@ -588,10 +607,11 @@ menu(){
     case "$choice" in
       1) setup_config_interactive; start_monitor; break ;;
       2) stop_monitor; generate_report; break ;;
-      3) cleanup_all; break ;;
-      4) setup_config_interactive ;;
-      5) show_status ;;
-      6) selftest ;;
+      3) instant_analysis; break ;;
+      4) cleanup_all; break ;;
+      5) setup_config_interactive ;;
+      6) show_status ;;
+      7) selftest ;;
       *) echo "Invalid choice" ;;
     esac
     echo
@@ -599,12 +619,13 @@ menu(){
 }
 
 case "${1:-}" in
-  start)        setup_config_interactive; start_monitor ;;  # start monitoring
-  stop-report)  stop_monitor; generate_report ;;            # stop and analyze
-  cleanup)      cleanup_all ;;                              # full cleanup
-  config)       setup_config_interactive ;;                 # config wizard
-  status)       show_status ;;                              # show status
-  selftest)     selftest ;;                                 # run selftest
-  "")           menu ;;                                     # show menu
+  start)        setup_config_interactive; start_monitor ;;
+  stop-report)  stop_monitor; generate_report ;;
+  analyze-now)  instant_analysis ;;
+  cleanup)      cleanup_all ;;
+  config)       setup_config_interactive ;;
+  status)       show_status ;;
+  selftest)     selftest ;;
+  "")           menu ;;
   *)            usage; exit 1 ;;
 esac
