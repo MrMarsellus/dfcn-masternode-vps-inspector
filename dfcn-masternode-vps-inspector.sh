@@ -784,17 +784,54 @@ start_event_sampler(){
 
 start_monitor(){
   load_config
-  for c in systemctl journalctl ps ss awk sed grep timeout date df free ip nohup find flock; do require_cmd "$c"; done
+
+  # ProTx Hash prompt
+  if [ -z "${PROTX_HASH:-}" ]; then
+    echo
+    echo "No ProTx hash configured. PoSe tracking requires it."
+    if ask_yes_no "Enter ProTx hash now?" y; then
+      read -r -p "ProTx hash: " input_protx || true
+      if [ -n "${input_protx:-}" ]; then
+        PROTX_HASH="$input_protx"
+        sed -i 's|^PROTX_HASH=.*|PROTX_HASH="'"$PROTX_HASH"'"|' "$CFG_FILE"
+        echo "ProTx hash saved."
+      else
+        echo "No input, skipping. PoSe tracking will be disabled."
+      fi
+    else
+      echo "Skipping. PoSe tracking will be disabled."
+    fi
+    echo
+  else
+    echo
+    echo "ProTx hash in use: $PROTX_HASH"
+    if ask_yes_no "Change ProTx hash?" n; then
+      read -r -p "New ProTx hash: " input_protx || true
+      if [ -n "${input_protx:-}" ]; then
+        PROTX_HASH="$input_protx"
+        sed -i 's|^PROTX_HASH=.*|PROTX_HASH="'"$PROTX_HASH"'"|' "$CFG_FILE"
+        echo "ProTx hash updated."
+      fi
+    fi
+    echo
+  fi
+
+  for c in systemctl journalctl ps ss awk sed grep timeout date df free ip nohup find flock; do
+    require_cmd "$c"
+  done
+
   [ -x "$CLI_BIN" ] || warn "CLI not found or not executable: $CLI_BIN"
   write_monitor_script
   system_snapshot "$LOG_DIR/system-snapshot-$(date '+%F-%H%M%S').txt"
   collect_cli_snapshot "$LOG_DIR/cli-snapshot-$(date '+%F-%H%M%S').txt"
+
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     warn "Monitor already running with PID $(cat "$PID_FILE")"
   else
     nohup ionice -c "$IONICE_CLASS" nice -n "$NICE_LEVEL" "$MONITOR_SCRIPT" >> "$LOG_DIR/monitor-stdout.log" 2>&1 &
     sleep 1
   fi
+
   start_journal_follow
   start_event_sampler
   log "Inspector started. Logs: $LOG_DIR"
