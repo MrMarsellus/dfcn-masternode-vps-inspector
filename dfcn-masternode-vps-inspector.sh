@@ -66,7 +66,39 @@ show_file(){
   fi
 }
 
-browse_logs(){
+write_all_logs_to_bundle() {
+  local outfile ts f
+  ts="$(date +%F-%H%M%S)"
+  outfile="${REPORT_DIR}/all-logs-${ts}.txt"
+
+  mkdir -p "$REPORT_DIR"
+  : > "$outfile"
+
+  for f in "$@"; do
+    {
+      echo "============================================================"
+      echo "FILE: $(basename "$f")"
+      echo "PATH: $f"
+      echo "============================================================"
+      cat "$f"
+      echo
+    } >> "$outfile"
+  done
+
+  echo
+  print_line
+  print_line
+  echo "All logs were written to a single bundle file."
+  echo "You can copy and run this command to print the full bundle:"
+  echo "cat \"$outfile\""
+  echo
+  echo "Example copy command:"
+  echo "scp user@your-vps:\"$outfile\" ."
+  print_line
+  echo
+}
+
+browse_logs() {
   local files=() sel i f
   while true; do
     files=()
@@ -86,7 +118,7 @@ browse_logs(){
       "$LOG_DIR/monitor-stdout.log" \
       "$LOG_DIR/event-sampler-stdout.log"
     do
-      [ -f "$f" ] && files+=("$f")
+      [[ -f "$f" ]] && files+=("$f")
     done
 
     echo
@@ -104,23 +136,31 @@ browse_logs(){
 
     i=1
     for f in "${files[@]}"; do
-      echo "  $i) $(basename "$f")"
+      echo "$i) $(basename "$f")"
       i=$((i+1))
     done
-    echo "  q) Back"
+    echo "a) Write all logs to bundle file"
+    echo "q) Back"
     echo
 
     read -r -p "Choose log file: " sel || true
     case "$sel" in
-      q|Q|"") return 0 ;;
+      q|Q)
+        return 0
+        ;;
+      a|A)
+        write_all_logs_to_bundle "${files[@]}"
+        ask_yes_no "Show another log file?" y || return 0
+        ;;
+      *)
+        if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#files[@]}" ]; then
+          show_file "${files[$((sel-1))]}"
+          ask_yes_no "Show another log file?" y || return 0
+        else
+          echo "Invalid choice."
+        fi
+        ;;
     esac
-
-    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#files[@]}" ]; then
-      show_file "${files[$((sel-1))]}"
-      ask_yes_no "Show another log file?" y || return 0
-    else
-      echo "Invalid choice"
-    fi
   done
 }
 
@@ -1162,7 +1202,7 @@ selftest() {
     else
       timeout 15 "$CLI_BIN" -datadir="$DATA_DIR" -conf="$CONF_FILE" getblockchaininfo 2>/dev/null || true
     fi
-  } | less
+    } | { have_cmd less && less || cat; }
 }
 
 show_workflow(){
