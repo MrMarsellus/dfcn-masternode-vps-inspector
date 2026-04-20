@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="dfcn-masternode-vps-inspector"
-VERSION="0.4.6"
+VERSION="0.4.7"
 BASE_DIR="${HOME}/.${APP_NAME}"
 INSTALL_PATH_DEFAULT="${HOME}/dfcn-masternode-vps-inspector.sh"
 LOG_DIR="${BASE_DIR}/logs"
